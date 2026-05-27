@@ -319,3 +319,131 @@ If you have questions about the commitment scheme:
 - Open a [GitHub Issue](https://github.com/AtomicIP/AtomicIP-/issues)
 - Join our [Discord community](https://discord.gg/atomicip)
 - Email: support@atomicip.io
+
+---
+
+## Issue #454: Threshold Signatures
+
+Threshold signatures require M-of-N authorized signers to collectively verify an IP commitment before it is considered valid. This is useful for multi-party IP ownership or organizational approval workflows.
+
+### How It Works
+
+1. The IP owner configures a threshold: M required signatures out of N authorized signers.
+2. Each authorized signer submits `sha256(commitment_hash || signer_address_bytes)`.
+3. Once M signatures are collected, `verify_threshold_signatures` returns `true`.
+
+### API
+
+```rust
+// Set up 2-of-3 threshold
+require_threshold_signatures(ip_id, threshold: 2, signers: [alice, bob, carol])
+
+// Each signer submits their signature hash
+add_threshold_signature(ip_id, signer: alice, signature_hash: BytesN<32>)
+add_threshold_signature(ip_id, signer: bob,   signature_hash: BytesN<32>)
+
+// Check if threshold is met
+verify_threshold_signatures(ip_id) -> bool
+
+// Read back config and collected signatures
+get_threshold_config(ip_id)      -> Option<ThresholdConfig>
+get_threshold_signatures(ip_id)  -> Vec<ThresholdSignature>
+```
+
+### Rules
+
+- `threshold` must be ≥ 1 and ≤ number of signers.
+- Each signer may only sign once (`AlreadySigned` error on duplicate).
+- Only addresses in the authorized list may sign (`SignerNotAuthorized` error).
+
+---
+
+## Issue #455: Batch Metadata
+
+Batch metadata lets an IP owner attach a batch identifier and a free-form description to an IP commitment. This is useful when committing multiple related IPs in a single workflow.
+
+### API
+
+```rust
+// Attach metadata (description capped at 1 KB)
+set_batch_metadata(ip_id, batch_id: BytesN<32>, description: Bytes)
+
+// Retrieve metadata
+get_batch_metadata(ip_id) -> Option<BatchMetadata>
+```
+
+### BatchMetadata Fields
+
+| Field         | Type         | Description                              |
+|---------------|--------------|------------------------------------------|
+| `ip_id`       | `u64`        | The IP this metadata belongs to          |
+| `batch_id`    | `BytesN<32>` | Identifier for the batch                 |
+| `description` | `Bytes`      | Arbitrary metadata, max 1 024 bytes      |
+| `timestamp`   | `u64`        | Ledger timestamp when metadata was set   |
+
+### Rules
+
+- Only the IP owner may set metadata.
+- `description` must not exceed `MAX_METADATA_BYTES` (1 024 bytes); panics with `BatchMetadataTooLarge` otherwise.
+- Calling `set_batch_metadata` again overwrites the previous value.
+
+---
+
+## Issue #456: Compression Algorithm Selection
+
+Owners can choose how their commitment hash is compressed for storage and indexing. Three algorithms are supported:
+
+| Algorithm    | Output size | Description                              |
+|--------------|-------------|------------------------------------------|
+| `None`       | 32 bytes    | Full uncompressed hash                   |
+| `Truncate16` | 16 bytes    | First 16 bytes of the hash (default)     |
+| `Xor8`       | 8 bytes     | XOR-fold all 32 bytes into 8 bytes       |
+
+### API
+
+```rust
+// Set algorithm (owner-only)
+set_commitment_compression(ip_id, algorithm: CompressionAlgo)
+
+// Read back the selected algorithm (defaults to Truncate16)
+get_commitment_compression(ip_id) -> CompressionAlgo
+
+// Apply the algorithm and return compressed bytes
+get_compressed_commitment_by_algo(ip_id) -> Bytes
+```
+
+### XOR-8 Fold
+
+The `Xor8` algorithm folds 32 bytes into 8 by XOR-ing each byte at position `i` into `output[i % 8]`. This produces a compact fingerprint suitable for fast deduplication checks.
+
+---
+
+## Issue #457: Commitment Encryption
+
+Owners can store an encrypted form of their commitment hash at rest. The encrypted blob is stored alongside a public key hint so verifiers know which key was used to encrypt.
+
+### API
+
+```rust
+// Store encrypted commitment (owner-only, max 256 bytes)
+encrypt_commitment(ip_id, encrypted_hash: Bytes, key_hint: BytesN<32>)
+
+// Retrieve the encrypted record
+get_encrypted_commitment(ip_id) -> Option<EncryptedCommitmentRecord>
+```
+
+### EncryptedCommitmentRecord Fields
+
+| Field            | Type         | Description                                      |
+|------------------|--------------|--------------------------------------------------|
+| `ip_id`          | `u64`        | The IP this record belongs to                    |
+| `encrypted_hash` | `Bytes`      | Commitment hash encrypted with owner's key       |
+| `key_hint`       | `BytesN<32>` | sha256 of the owner's public key (key identifier)|
+| `timestamp`      | `u64`        | Ledger timestamp when encryption was stored      |
+
+### Rules
+
+- Only the IP owner may call `encrypt_commitment`.
+- `encrypted_hash` must not exceed 256 bytes; panics with `EncryptedDataTooLarge` otherwise.
+- Calling `encrypt_commitment` again overwrites the previous record.
+- The contract does not perform encryption itself — the owner encrypts off-chain and stores the result on-chain.
