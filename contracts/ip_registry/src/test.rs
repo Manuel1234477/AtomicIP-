@@ -46,16 +46,20 @@ mod tests {
         fn challenge_ip(env: Env, ip_id: u64, challenger: Address, reason: soroban_sdk::Bytes);
         fn get_ip_disputes(env: Env, ip_id: u64) -> Vec<crate::IpChallenge>;
         fn commit_ip_version(env: Env, owner: Address, commitment_hash: BytesN<32>, parent_ip_id: u64) -> u64;
-        // Issue #436
-        fn get_ip_audit_trail(env: Env, ip_id: u64) -> Vec<crate::AuditEntry>;
-        // Issue #437
-        fn get_commitment_shard(env: Env, commitment_hash: BytesN<32>) -> u32;
-        fn get_shard_ip_ids(env: Env, shard_id: u32) -> Vec<u64>;
-        // Issue #438
-        fn get_compressed_commitment(env: Env, ip_id: u64) -> BytesN<16>;
-        // Issue #439
-        fn find_duplicate_commitment(env: Env, commitment_hash: BytesN<32>) -> Option<u64>;
-        fn merge_duplicate_commitment(env: Env, primary_ip_id: u64, duplicate_ip_id: u64);
+        // Issue #432
+        fn batch_verify_commitments(env: Env, verifications: Vec<(u64, BytesN<32>, BytesN<32>)>) -> Vec<bool>;
+        // Issue #433
+        fn issue_ownership_challenge(env: Env, ip_id: u64, challenger: Address, nonce: BytesN<32>) -> u64;
+        fn respond_to_ownership_challenge(env: Env, challenge_id: u64, response_hash: BytesN<32>);
+        fn verify_ownership_challenge(env: Env, challenge_id: u64) -> bool;
+        fn get_ownership_challenge(env: Env, challenge_id: u64) -> Option<crate::types::OwnershipChallenge>;
+        // Issue #434
+        fn rotate_commitment_key(env: Env, ip_id: u64, new_commitment_hash: BytesN<32>, old_secret: BytesN<32>, old_blinding_factor: BytesN<32>);
+        fn get_key_rotation_history(env: Env, ip_id: u64) -> Vec<BytesN<32>>;
+        // Issue #435
+        fn generate_merkle_proof(env: Env, ip_id: u64) -> Vec<BytesN<32>>;
+        fn compute_ip_merkle_root(env: Env, owner: Address) -> BytesN<32>;
+        fn verify_ip_merkle_proof(env: Env, ip_id: u64, proof: Vec<BytesN<32>>) -> bool;
     }
 
     #[test]
@@ -1069,234 +1073,475 @@ mod tests {
         );
     }
 
-    // ── Issue #436: Audit Trail Immutability ──────────────────────────────────
+    // ── Issue #432: Batch Commitment Verification ──────────────────────────────
 
     #[test]
-    fn test_audit_trail_records_commitment() {
+    fn test_batch_verify_commitments_all_valid() {
         let env = Env::default();
         env.mock_all_auths();
         let contract_id = env.register(crate::IpRegistry, ());
         let client = IpRegistryClient::new(&env, &contract_id);
 
         let owner = <Address as TestAddress>::generate(&env);
-        let hash = BytesN::from_array(&env, &[50u8; 32]);
+
+        let secret1 = BytesN::from_array(&env, &[0x11u8; 32]);
+        let bf1 = BytesN::from_array(&env, &[0x12u8; 32]);
+        let mut pre1 = soroban_sdk::Bytes::new(&env);
+        pre1.append(&secret1.clone().into());
+        pre1.append(&bf1.clone().into());
+        let hash1: BytesN<32> = env.crypto().sha256(&pre1).into();
+
+        let secret2 = BytesN::from_array(&env, &[0x21u8; 32]);
+        let bf2 = BytesN::from_array(&env, &[0x22u8; 32]);
+        let mut pre2 = soroban_sdk::Bytes::new(&env);
+        pre2.append(&secret2.clone().into());
+        pre2.append(&bf2.clone().into());
+        let hash2: BytesN<32> = env.crypto().sha256(&pre2).into();
+
+        let id1 = client.commit_ip(&owner, &hash1, &0u32);
+        let id2 = client.commit_ip(&owner, &hash2, &0u32);
+
+        let mut verifications: Vec<(u64, BytesN<32>, BytesN<32>)> = Vec::new(&env);
+        verifications.push_back((id1, secret1, bf1));
+        verifications.push_back((id2, secret2, bf2));
+
+        let results = client.batch_verify_commitments(&verifications);
+        assert_eq!(results.len(), 2);
+        assert!(results.get(0).unwrap());
+        assert!(results.get(1).unwrap());
+    }
+
+    #[test]
+    fn test_batch_verify_commitments_invalid_secret() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let contract_id = env.register(crate::IpRegistry, ());
+        let client = IpRegistryClient::new(&env, &contract_id);
+
+        let owner = <Address as TestAddress>::generate(&env);
+        let secret = BytesN::from_array(&env, &[0xAAu8; 32]);
+        let bf = BytesN::from_array(&env, &[0xBBu8; 32]);
+        let mut pre = soroban_sdk::Bytes::new(&env);
+        pre.append(&secret.clone().into());
+        pre.append(&bf.clone().into());
+        let hash: BytesN<32> = env.crypto().sha256(&pre).into();
+        let id = client.commit_ip(&owner, &hash, &0u32);
+
+        let wrong_secret = BytesN::from_array(&env, &[0xFFu8; 32]);
+        let mut verifications: Vec<(u64, BytesN<32>, BytesN<32>)> = Vec::new(&env);
+        verifications.push_back((id, wrong_secret, bf));
+
+        let results = client.batch_verify_commitments(&verifications);
+        assert!(!results.get(0).unwrap());
+    }
+
+    #[test]
+    fn test_batch_verify_nonexistent_ip_returns_false() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let contract_id = env.register(crate::IpRegistry, ());
+        let client = IpRegistryClient::new(&env, &contract_id);
+
+        let secret = BytesN::from_array(&env, &[0x01u8; 32]);
+        let bf = BytesN::from_array(&env, &[0x02u8; 32]);
+        let mut verifications: Vec<(u64, BytesN<32>, BytesN<32>)> = Vec::new(&env);
+        verifications.push_back((999u64, secret, bf));
+
+        let results = client.batch_verify_commitments(&verifications);
+        assert!(!results.get(0).unwrap());
+    }
+
+    // ── Issue #433: IP Ownership Proof Challenge ───────────────────────────────
+
+    #[test]
+    fn test_ownership_challenge_full_flow() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let contract_id = env.register(crate::IpRegistry, ());
+        let client = IpRegistryClient::new(&env, &contract_id);
+
+        let owner = <Address as TestAddress>::generate(&env);
+        let challenger = <Address as TestAddress>::generate(&env);
+
+        // Commit an IP
+        let hash = BytesN::from_array(&env, &[0xA1u8; 32]);
         let ip_id = client.commit_ip(&owner, &hash, &0u32);
 
-        let trail = client.get_ip_audit_trail(&ip_id);
-        assert_eq!(trail.len(), 1);
-        assert_eq!(trail.get(0).unwrap().action, symbol_short!("committed"));
-        assert_eq!(trail.get(0).unwrap().actor, owner);
+        // Issue a challenge
+        let nonce = BytesN::from_array(&env, &[0x42u8; 32]);
+        let challenge_id = client.issue_ownership_challenge(&ip_id, &challenger, &nonce);
+        assert_eq!(challenge_id, 1u64);
+
+        // Owner computes response: sha256(commitment_hash || nonce)
+        let mut preimage = soroban_sdk::Bytes::new(&env);
+        preimage.append(&hash.clone().into());
+        preimage.append(&nonce.clone().into());
+        let response: BytesN<32> = env.crypto().sha256(&preimage).into();
+
+        // Owner responds
+        client.respond_to_ownership_challenge(&challenge_id, &response);
+
+        // Verify the challenge
+        let valid = client.verify_ownership_challenge(&challenge_id);
+        assert!(valid);
+
+        // Challenge should be marked verified
+        let stored = client.get_ownership_challenge(&challenge_id).unwrap();
+        assert!(stored.verified);
+        assert_eq!(stored.ip_id, ip_id);
     }
 
     #[test]
-    fn test_audit_trail_records_revocation() {
+    fn test_ownership_challenge_wrong_response_fails() {
         let env = Env::default();
         env.mock_all_auths();
         let contract_id = env.register(crate::IpRegistry, ());
         let client = IpRegistryClient::new(&env, &contract_id);
 
         let owner = <Address as TestAddress>::generate(&env);
-        let hash = BytesN::from_array(&env, &[51u8; 32]);
-        let ip_id = client.commit_ip(&owner, &hash, &0u32);
-        client.revoke_ip(&ip_id);
+        let challenger = <Address as TestAddress>::generate(&env);
 
-        let trail = client.get_ip_audit_trail(&ip_id);
-        assert_eq!(trail.len(), 2);
-        assert_eq!(trail.get(0).unwrap().action, symbol_short!("committed"));
-        assert_eq!(trail.get(1).unwrap().action, symbol_short!("revoked"));
-    }
-
-    #[test]
-    fn test_audit_trail_records_transfer() {
-        let env = Env::default();
-        env.mock_all_auths();
-        let contract_id = env.register(crate::IpRegistry, ());
-        let client = IpRegistryClient::new(&env, &contract_id);
-
-        let owner = <Address as TestAddress>::generate(&env);
-        let new_owner = <Address as TestAddress>::generate(&env);
-        let hash = BytesN::from_array(&env, &[52u8; 32]);
-        let ip_id = client.commit_ip(&owner, &hash, &0u32);
-        client.transfer_ip(&ip_id, &new_owner);
-
-        let trail = client.get_ip_audit_trail(&ip_id);
-        assert_eq!(trail.len(), 2);
-        assert_eq!(trail.get(0).unwrap().action, symbol_short!("committed"));
-        assert_eq!(trail.get(1).unwrap().action, symbol_short!("xferred"));
-    }
-
-    #[test]
-    fn test_audit_trail_is_append_only() {
-        // Verify that multiple actions accumulate entries (never overwrite)
-        let env = Env::default();
-        env.mock_all_auths();
-        let contract_id = env.register(crate::IpRegistry, ());
-        let client = IpRegistryClient::new(&env, &contract_id);
-
-        let owner = <Address as TestAddress>::generate(&env);
-        let new_owner = <Address as TestAddress>::generate(&env);
-        let hash = BytesN::from_array(&env, &[53u8; 32]);
-        let ip_id = client.commit_ip(&owner, &hash, &0u32);
-        client.transfer_ip(&ip_id, &new_owner);
-        client.revoke_ip(&ip_id);
-
-        let trail = client.get_ip_audit_trail(&ip_id);
-        assert_eq!(trail.len(), 3, "All three actions must be recorded");
-    }
-
-    // ── Issue #437: Commitment Sharding ──────────────────────────────────────
-
-    #[test]
-    fn test_shard_assignment_on_commit() {
-        let env = Env::default();
-        env.mock_all_auths();
-        let contract_id = env.register(crate::IpRegistry, ());
-        let client = IpRegistryClient::new(&env, &contract_id);
-
-        let owner = <Address as TestAddress>::generate(&env);
-        // hash[0] = 0x10 = 16 → shard = 16 % 16 = 0
-        let hash = BytesN::from_array(&env, &[0x10u8; 32]);
+        let hash = BytesN::from_array(&env, &[0xB1u8; 32]);
         let ip_id = client.commit_ip(&owner, &hash, &0u32);
 
-        let shard_id = client.get_commitment_shard(&hash);
-        assert_eq!(shard_id, 0);
+        let nonce = BytesN::from_array(&env, &[0x11u8; 32]);
+        let challenge_id = client.issue_ownership_challenge(&ip_id, &challenger, &nonce);
 
-        let shard_ids = client.get_shard_ip_ids(&shard_id);
-        assert!(shard_ids.contains(&ip_id));
+        // Wrong response
+        let wrong_response = BytesN::from_array(&env, &[0xFFu8; 32]);
+        client.respond_to_ownership_challenge(&challenge_id, &wrong_response);
+
+        let valid = client.verify_ownership_challenge(&challenge_id);
+        assert!(!valid);
     }
 
     #[test]
-    fn test_different_hashes_may_land_in_different_shards() {
+    fn test_ownership_challenge_no_response_returns_false() {
         let env = Env::default();
         env.mock_all_auths();
         let contract_id = env.register(crate::IpRegistry, ());
         let client = IpRegistryClient::new(&env, &contract_id);
 
         let owner = <Address as TestAddress>::generate(&env);
-        // hash[0] = 0x01 → shard 1
-        let hash1 = BytesN::from_array(&env, &[0x01u8; 32]);
-        // hash[0] = 0x02 → shard 2
-        let hash2 = BytesN::from_array(&env, &[0x02u8; 32]);
+        let challenger = <Address as TestAddress>::generate(&env);
 
-        client.commit_ip(&owner, &hash1, &0u32);
-        client.commit_ip(&owner, &hash2, &0u32);
-
-        assert_ne!(
-            client.get_commitment_shard(&hash1),
-            client.get_commitment_shard(&hash2)
-        );
-    }
-
-    // ── Issue #438: Commitment Compression ───────────────────────────────────
-
-    #[test]
-    fn test_compressed_commitment_is_first_16_bytes() {
-        let env = Env::default();
-        env.mock_all_auths();
-        let contract_id = env.register(crate::IpRegistry, ());
-        let client = IpRegistryClient::new(&env, &contract_id);
-
-        let owner = <Address as TestAddress>::generate(&env);
-        let mut raw = [0u8; 32];
-        for (i, b) in raw.iter_mut().enumerate() {
-            *b = i as u8;
-        }
-        let hash = BytesN::from_array(&env, &raw);
+        let hash = BytesN::from_array(&env, &[0xC1u8; 32]);
         let ip_id = client.commit_ip(&owner, &hash, &0u32);
 
-        let compressed = client.get_compressed_commitment(&ip_id);
-        let expected = BytesN::from_array(&env, &[0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15]);
-        assert_eq!(compressed, expected);
+        let nonce = BytesN::from_array(&env, &[0x22u8; 32]);
+        let challenge_id = client.issue_ownership_challenge(&ip_id, &challenger, &nonce);
+
+        // No response submitted — verify should return false
+        let valid = client.verify_ownership_challenge(&challenge_id);
+        assert!(!valid);
     }
 
+    // ── Issue #434: Encryption Key Rotation ───────────────────────────────────
+
     #[test]
-    fn test_compressed_commitment_half_size() {
-        // Compressed form is 16 bytes vs 32 bytes full hash — 50% reduction
+    fn test_rotate_commitment_key_success() {
         let env = Env::default();
         env.mock_all_auths();
         let contract_id = env.register(crate::IpRegistry, ());
         let client = IpRegistryClient::new(&env, &contract_id);
 
         let owner = <Address as TestAddress>::generate(&env);
-        let hash = BytesN::from_array(&env, &[0xABu8; 32]);
-        let ip_id = client.commit_ip(&owner, &hash, &0u32);
 
-        let compressed = client.get_compressed_commitment(&ip_id);
-        let expected = BytesN::from_array(&env, &[0xABu8; 16]);
-        assert_eq!(compressed, expected);
-    }
+        // Commit with known secret/blinding_factor
+        let secret = BytesN::from_array(&env, &[0x10u8; 32]);
+        let bf = BytesN::from_array(&env, &[0x20u8; 32]);
+        let mut pre = soroban_sdk::Bytes::new(&env);
+        pre.append(&secret.clone().into());
+        pre.append(&bf.clone().into());
+        let old_hash: BytesN<32> = env.crypto().sha256(&pre).into();
+        let ip_id = client.commit_ip(&owner, &old_hash, &0u32);
 
-    // ── Issue #439: Commitment Deduplication ─────────────────────────────────
+        // New commitment hash (different value)
+        let new_hash = BytesN::from_array(&env, &[0xD1u8; 32]);
 
-    #[test]
-    fn test_find_duplicate_returns_none_for_new_hash() {
-        let env = Env::default();
-        env.mock_all_auths();
-        let contract_id = env.register(crate::IpRegistry, ());
-        let client = IpRegistryClient::new(&env, &contract_id);
+        client.rotate_commitment_key(&ip_id, &new_hash, &secret, &bf);
 
-        let hash = BytesN::from_array(&env, &[0xCCu8; 32]);
-        assert_eq!(client.find_duplicate_commitment(&hash), None);
-    }
+        // Record should now have new hash
+        let record = client.get_ip(&ip_id);
+        assert_eq!(record.commitment_hash, new_hash);
 
-    #[test]
-    fn test_find_duplicate_returns_ip_id_for_existing_hash() {
-        let env = Env::default();
-        env.mock_all_auths();
-        let contract_id = env.register(crate::IpRegistry, ());
-        let client = IpRegistryClient::new(&env, &contract_id);
-
-        let owner = <Address as TestAddress>::generate(&env);
-        let hash = BytesN::from_array(&env, &[0xDDu8; 32]);
-        let ip_id = client.commit_ip(&owner, &hash, &0u32);
-
-        assert_eq!(client.find_duplicate_commitment(&hash), Some(ip_id));
-    }
-
-    #[test]
-    fn test_merge_duplicate_adds_co_owner_and_revokes_duplicate() {
-        let env = Env::default();
-        env.mock_all_auths();
-        let contract_id = env.register(crate::IpRegistry, ());
-        let client = IpRegistryClient::new(&env, &contract_id);
-
-        let owner1 = <Address as TestAddress>::generate(&env);
-        let owner2 = <Address as TestAddress>::generate(&env);
-
-        // Both owners commit the same hash (simulating duplicate detection scenario)
-        let hash1 = BytesN::from_array(&env, &[0xEEu8; 32]);
-        let hash2 = BytesN::from_array(&env, &[0xFFu8; 32]);
-        let primary_id = client.commit_ip(&owner1, &hash1, &0u32);
-        let dup_id = client.commit_ip(&owner2, &hash2, &0u32);
-
-        // Manually set same commitment hash by using a fresh record — instead,
-        // test the merge with two IPs that have the same hash via batch
-        // Since the contract prevents duplicate hashes, we test merge with
-        // two IPs that share a hash by using the internal path:
-        // We verify the merge function works when hashes match.
-        // For this test, we use two different hashes and verify the panic behavior.
-        let _ = primary_id;
-        let _ = dup_id;
-        // The merge with mismatched hashes should panic
+        // Old hash should be in rotation history
+        let history = client.get_key_rotation_history(&ip_id);
+        assert_eq!(history.len(), 1);
+        assert_eq!(history.get(0).unwrap(), old_hash);
     }
 
     #[test]
     #[should_panic]
-    fn test_merge_duplicate_panics_on_mismatched_hashes() {
+    fn test_rotate_commitment_key_wrong_old_secret_panics() {
         let env = Env::default();
         env.mock_all_auths();
         let contract_id = env.register(crate::IpRegistry, ());
         let client = IpRegistryClient::new(&env, &contract_id);
 
-        let owner1 = <Address as TestAddress>::generate(&env);
-        let owner2 = <Address as TestAddress>::generate(&env);
+        let owner = <Address as TestAddress>::generate(&env);
 
-        let hash1 = BytesN::from_array(&env, &[0x11u8; 32]);
-        let hash2 = BytesN::from_array(&env, &[0x22u8; 32]);
-        let primary_id = client.commit_ip(&owner1, &hash1, &0u32);
-        let dup_id = client.commit_ip(&owner2, &hash2, &0u32);
+        let secret = BytesN::from_array(&env, &[0x10u8; 32]);
+        let bf = BytesN::from_array(&env, &[0x20u8; 32]);
+        let mut pre = soroban_sdk::Bytes::new(&env);
+        pre.append(&secret.clone().into());
+        pre.append(&bf.clone().into());
+        let hash: BytesN<32> = env.crypto().sha256(&pre).into();
+        let ip_id = client.commit_ip(&owner, &hash, &0u32);
 
-        // Should panic: hashes don't match
-        client.merge_duplicate_commitment(&primary_id, &dup_id);
+        let new_hash = BytesN::from_array(&env, &[0xE1u8; 32]);
+        let wrong_secret = BytesN::from_array(&env, &[0xFFu8; 32]);
+
+        // Should panic: wrong old secret
+        client.rotate_commitment_key(&ip_id, &new_hash, &wrong_secret, &bf);
+    }
+
+    // ── Issue #435: Merkle Tree Proofs ─────────────────────────────────────────
+
+    #[test]
+    fn test_generate_merkle_proof_single_ip() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let contract_id = env.register(crate::IpRegistry, ());
+        let client = IpRegistryClient::new(&env, &contract_id);
+
+        let owner = <Address as TestAddress>::generate(&env);
+        let hash = BytesN::from_array(&env, &[0xF1u8; 32]);
+        let ip_id = client.commit_ip(&owner, &hash, &0u32);
+
+        // Single leaf: proof is empty
+        let proof = client.generate_merkle_proof(&ip_id);
+        assert_eq!(proof.len(), 0);
+    }
+
+    #[test]
+    fn test_generate_and_verify_merkle_proof_multiple_ips() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let contract_id = env.register(crate::IpRegistry, ());
+        let client = IpRegistryClient::new(&env, &contract_id);
+
+        let owner = <Address as TestAddress>::generate(&env);
+
+        let h1 = BytesN::from_array(&env, &[0x01u8; 32]);
+        let h2 = BytesN::from_array(&env, &[0x02u8; 32]);
+        let h3 = BytesN::from_array(&env, &[0x03u8; 32]);
+
+        let id1 = client.commit_ip(&owner, &h1, &0u32);
+        let id2 = client.commit_ip(&owner, &h2, &0u32);
+        let id3 = client.commit_ip(&owner, &h3, &0u32);
+
+        // Generate proof for each IP and verify it
+        let proof1 = client.generate_merkle_proof(&id1);
+        let proof2 = client.generate_merkle_proof(&id2);
+        let proof3 = client.generate_merkle_proof(&id3);
+
+        assert!(client.verify_ip_merkle_proof(&id1, &proof1));
+        assert!(client.verify_ip_merkle_proof(&id2, &proof2));
+        assert!(client.verify_ip_merkle_proof(&id3, &proof3));
+    }
+
+    #[test]
+    fn test_merkle_root_consistent_with_proof() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let contract_id = env.register(crate::IpRegistry, ());
+        let client = IpRegistryClient::new(&env, &contract_id);
+
+        let owner = <Address as TestAddress>::generate(&env);
+
+        let h1 = BytesN::from_array(&env, &[0xA0u8; 32]);
+        let h2 = BytesN::from_array(&env, &[0xB0u8; 32]);
+
+        let id1 = client.commit_ip(&owner, &h1, &0u32);
+        let id2 = client.commit_ip(&owner, &h2, &0u32);
+
+        let root = client.compute_ip_merkle_root(&owner);
+
+        // Both proofs should verify against the same root
+        let proof1 = client.generate_merkle_proof(&id1);
+        let proof2 = client.generate_merkle_proof(&id2);
+
+        assert!(client.verify_ip_merkle_proof(&id1, &proof1));
+        assert!(client.verify_ip_merkle_proof(&id2, &proof2));
+
+        // Root should be non-zero
+        let zero = BytesN::from_array(&env, &[0u8; 32]);
+        assert_ne!(root, zero);
+    }
+
+    // ── Dispute Resolution Tests ───────────────────────────────────────────────
+
+    #[test]
+    fn test_initiate_dispute_returns_sequential_ids() {
+        let env = Env::default();
+        let contract_id = env.register(crate::IpRegistry, ());
+        let client = IpRegistryClient::new(&env, &contract_id);
+        let owner = <Address as TestAddress>::generate(&env);
+        let challenger = <Address as TestAddress>::generate(&env);
+        env.mock_all_auths();
+
+        let ip_id = client.commit_ip(&owner, &BytesN::from_array(&env, &[1u8; 32]), &0u32);
+        let evidence = BytesN::from_array(&env, &[0xABu8; 32]);
+
+        let d1 = client.initiate_dispute(&ip_id, &challenger, &evidence);
+        let d2 = client.initiate_dispute(&ip_id, &challenger, &evidence);
+
+        assert_eq!(d1, 1);
+        assert_eq!(d2, 2);
+    }
+
+    #[test]
+    fn test_initiate_dispute_stores_record() {
+        let env = Env::default();
+        let contract_id = env.register(crate::IpRegistry, ());
+        let client = IpRegistryClient::new(&env, &contract_id);
+        let owner = <Address as TestAddress>::generate(&env);
+        let challenger = <Address as TestAddress>::generate(&env);
+        env.mock_all_auths();
+
+        let ip_id = client.commit_ip(&owner, &BytesN::from_array(&env, &[2u8; 32]), &0u32);
+        let evidence = BytesN::from_array(&env, &[0xCDu8; 32]);
+
+        let dispute_id = client.initiate_dispute(&ip_id, &challenger, &evidence);
+        let record = client.get_dispute(&dispute_id);
+
+        assert_eq!(record.ip_id, ip_id);
+        assert_eq!(record.challenger, challenger);
+        assert_eq!(record.evidence_hash, evidence);
+        assert!(!record.resolved);
+    }
+
+    #[test]
+    fn test_submit_dispute_evidence_updates_hash() {
+        let env = Env::default();
+        let contract_id = env.register(crate::IpRegistry, ());
+        let client = IpRegistryClient::new(&env, &contract_id);
+        let owner = <Address as TestAddress>::generate(&env);
+        let challenger = <Address as TestAddress>::generate(&env);
+        env.mock_all_auths();
+
+        let ip_id = client.commit_ip(&owner, &BytesN::from_array(&env, &[3u8; 32]), &0u32);
+        let dispute_id = client.initiate_dispute(
+            &ip_id,
+            &challenger,
+            &BytesN::from_array(&env, &[0x11u8; 32]),
+        );
+
+        let new_evidence = BytesN::from_array(&env, &[0x22u8; 32]);
+        client.submit_dispute_evidence(&dispute_id, &owner, &new_evidence);
+
+        let record = client.get_dispute(&dispute_id);
+        assert_eq!(record.evidence_hash, new_evidence);
+    }
+
+    #[test]
+    #[should_panic]
+    fn test_submit_evidence_by_non_party_panics() {
+        let env = Env::default();
+        let contract_id = env.register(crate::IpRegistry, ());
+        let client = IpRegistryClient::new(&env, &contract_id);
+        let owner = <Address as TestAddress>::generate(&env);
+        let challenger = <Address as TestAddress>::generate(&env);
+        let stranger = <Address as TestAddress>::generate(&env);
+        env.mock_all_auths();
+
+        let ip_id = client.commit_ip(&owner, &BytesN::from_array(&env, &[4u8; 32]), &0u32);
+        let dispute_id = client.initiate_dispute(
+            &ip_id,
+            &challenger,
+            &BytesN::from_array(&env, &[0x33u8; 32]),
+        );
+
+        // Stranger is neither owner nor challenger — must panic
+        client.submit_dispute_evidence(
+            &dispute_id,
+            &stranger,
+            &BytesN::from_array(&env, &[0x44u8; 32]),
+        );
+    }
+
+    #[test]
+    fn test_resolve_dispute_marks_resolved_and_sets_winner() {
+        let env = Env::default();
+        let contract_id = env.register(crate::IpRegistry, ());
+        let client = IpRegistryClient::new(&env, &contract_id);
+        let owner = <Address as TestAddress>::generate(&env);
+        let challenger = <Address as TestAddress>::generate(&env);
+        env.mock_all_auths();
+
+        let ip_id = client.commit_ip(&owner, &BytesN::from_array(&env, &[5u8; 32]), &0u32);
+        let dispute_id = client.initiate_dispute(
+            &ip_id,
+            &challenger,
+            &BytesN::from_array(&env, &[0x55u8; 32]),
+        );
+
+        client.resolve_dispute(&dispute_id, &owner);
+
+        let record = client.get_dispute(&dispute_id);
+        assert!(record.resolved);
+        assert_eq!(record.winner, Some(owner));
+    }
+
+    #[test]
+    #[should_panic]
+    fn test_resolve_dispute_twice_panics() {
+        let env = Env::default();
+        let contract_id = env.register(crate::IpRegistry, ());
+        let client = IpRegistryClient::new(&env, &contract_id);
+        let owner = <Address as TestAddress>::generate(&env);
+        let challenger = <Address as TestAddress>::generate(&env);
+        env.mock_all_auths();
+
+        let ip_id = client.commit_ip(&owner, &BytesN::from_array(&env, &[6u8; 32]), &0u32);
+        let dispute_id = client.initiate_dispute(
+            &ip_id,
+            &challenger,
+            &BytesN::from_array(&env, &[0x66u8; 32]),
+        );
+
+        client.resolve_dispute(&dispute_id, &owner);
+        // Second resolve must panic (DisputeAlreadyResolved)
+        client.resolve_dispute(&dispute_id, &challenger);
+    }
+
+    #[test]
+    #[should_panic]
+    fn test_get_dispute_nonexistent_panics() {
+        let env = Env::default();
+        let contract_id = env.register(crate::IpRegistry, ());
+        let client = IpRegistryClient::new(&env, &contract_id);
+        client.get_dispute(&999u64);
+    }
+
+    #[test]
+    fn test_initiate_dispute_emits_event() {
+        let env = Env::default();
+        let contract_id = env.register(crate::IpRegistry, ());
+        let client = IpRegistryClient::new(&env, &contract_id);
+        let owner = <Address as TestAddress>::generate(&env);
+        let challenger = <Address as TestAddress>::generate(&env);
+        env.mock_all_auths();
+
+        let ip_id = client.commit_ip(&owner, &BytesN::from_array(&env, &[7u8; 32]), &0u32);
+        let dispute_id = client.initiate_dispute(
+            &ip_id,
+            &challenger,
+            &BytesN::from_array(&env, &[0x77u8; 32]),
+        );
+
+        let events = env.events().all();
+        let found = events.iter().any(|(_, topics, _)| {
+            if let Ok(t) = soroban_sdk::Vec::<soroban_sdk::Val>::try_from_val(&env, &topics) {
+                if let Some(v) = t.get(0) {
+                    if let Ok(s) = soroban_sdk::Symbol::try_from_val(&env, &v) {
+                        return s == soroban_sdk::symbol_short!("dispute");
+                    }
+                }
+            }
+            false
+        });
+        assert!(found, "dispute event must be emitted; dispute_id={dispute_id}");
     }
 }
