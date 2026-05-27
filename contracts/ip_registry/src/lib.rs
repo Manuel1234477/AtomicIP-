@@ -2455,6 +2455,51 @@ impl IpRegistry {
         stored == recomputed
     }
 
+    // ── Issue: Batch Expire Commitments ─────────────────────────────────────────────────────────────────────────────────
+
+    /// Revoke multiple IP commitments in a single transaction.
+    ///
+    /// The caller must be the owner of every IP in the list. All IPs are
+    /// revoked atomically — if any check fails the entire transaction panics.
+    /// Returns the number of IPs revoked.
+    ///
+    /// # Panics
+    ///
+    /// Panics if any IP does not exist, the caller is not its owner, or it is
+    /// already revoked.
+    pub fn batch_revoke_commitments(env: Env, owner: Address, ip_ids: Vec<u64>) -> u32 {
+        owner.require_auth();
+
+        let mut count: u32 = 0;
+        for ip_id in ip_ids.iter() {
+            let mut record = require_ip_exists(&env, ip_id);
+            if record.owner != owner {
+                env.panic_with_error(soroban_sdk::Error::from_contract_error(
+                    ContractError::Unauthorized as u32,
+                ));
+            }
+            require_not_revoked(&env, &record);
+
+            record.revoked = true;
+            env.storage()
+                .persistent()
+                .set(&DataKey::IpRecord(ip_id), &record);
+            env.storage()
+                .persistent()
+                .extend_ttl(&DataKey::IpRecord(ip_id), 50000, 50000);
+
+            env.events().publish(
+                (symbol_short!("revoked"), owner.clone()),
+                (ip_id, env.ledger().timestamp()),
+            );
+
+            Self::append_audit_entry(&env, ip_id, symbol_short!("revoked"), owner.clone());
+            count += 1;
+        }
+
+        count
+    }
+
 fn require_is_revoked(env: &Env, record: &IpRecord) {
     if !record.revoked {
         env.panic_with_error(soroban_sdk::Error::from_contract_error(

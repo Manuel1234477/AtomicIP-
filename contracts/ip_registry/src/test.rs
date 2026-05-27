@@ -65,6 +65,7 @@ mod tests {
         fn get_snapshot(env: Env, snapshot_id: u64) -> Option<crate::CommitmentSnapshot>;
         fn compute_integrity_checksum(env: Env, caller: Address) -> BytesN<32>;
         fn verify_integrity_checksum(env: Env) -> bool;
+        fn batch_revoke_commitments(env: Env, owner: Address, ip_ids: Vec<u64>) -> u32;
         fn initiate_dispute(env: Env, ip_id: u64, challenger: Address, evidence_hash: BytesN<32>) -> u64;
         fn submit_dispute_evidence(env: Env, dispute_id: u64, submitter: Address, evidence_hash: BytesN<32>);
         fn resolve_dispute(env: Env, dispute_id: u64, winner: Address);
@@ -1677,6 +1678,77 @@ mod tests {
 
         assert_ne!(checksum_before, checksum_after);
         assert!(client.verify_integrity_checksum());
+    }
+
+    // ── Issue: Batch Expire Commitments ─────────────────────────────────────────────────────────────────────────────────
+
+    #[test]
+    fn test_batch_revoke_commitments_marks_all_revoked() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let contract_id = env.register(crate::IpRegistry, ());
+        let client = IpRegistryClient::new(&env, &contract_id);
+
+        let owner = <Address as TestAddress>::generate(&env);
+        let id1 = client.commit_ip(&owner, &BytesN::from_array(&env, &[0x01u8; 32]), &0u32);
+        let id2 = client.commit_ip(&owner, &BytesN::from_array(&env, &[0x02u8; 32]), &0u32);
+        let id3 = client.commit_ip(&owner, &BytesN::from_array(&env, &[0x03u8; 32]), &0u32);
+
+        let ids = Vec::from_array(&env, [id1, id2, id3]);
+        let count = client.batch_revoke_commitments(&owner, &ids);
+
+        assert_eq!(count, 3u32);
+        assert!(client.get_ip(&id1).revoked);
+        assert!(client.get_ip(&id2).revoked);
+        assert!(client.get_ip(&id3).revoked);
+    }
+
+    #[test]
+    fn test_batch_revoke_returns_correct_count() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let contract_id = env.register(crate::IpRegistry, ());
+        let client = IpRegistryClient::new(&env, &contract_id);
+
+        let owner = <Address as TestAddress>::generate(&env);
+        let id1 = client.commit_ip(&owner, &BytesN::from_array(&env, &[0x04u8; 32]), &0u32);
+        let id2 = client.commit_ip(&owner, &BytesN::from_array(&env, &[0x05u8; 32]), &0u32);
+
+        let ids = Vec::from_array(&env, [id1, id2]);
+        let count = client.batch_revoke_commitments(&owner, &ids);
+        assert_eq!(count, 2u32);
+    }
+
+    #[test]
+    #[should_panic]
+    fn test_batch_revoke_already_revoked_panics() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let contract_id = env.register(crate::IpRegistry, ());
+        let client = IpRegistryClient::new(&env, &contract_id);
+
+        let owner = <Address as TestAddress>::generate(&env);
+        let id1 = client.commit_ip(&owner, &BytesN::from_array(&env, &[0x06u8; 32]), &0u32);
+        client.revoke_ip(&id1);
+
+        let ids = Vec::from_array(&env, [id1]);
+        client.batch_revoke_commitments(&owner, &ids);
+    }
+
+    #[test]
+    #[should_panic]
+    fn test_batch_revoke_wrong_owner_panics() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let contract_id = env.register(crate::IpRegistry, ());
+        let client = IpRegistryClient::new(&env, &contract_id);
+
+        let owner = <Address as TestAddress>::generate(&env);
+        let attacker = <Address as TestAddress>::generate(&env);
+        let id1 = client.commit_ip(&owner, &BytesN::from_array(&env, &[0x07u8; 32]), &0u32);
+
+        let ids = Vec::from_array(&env, [id1]);
+        client.batch_revoke_commitments(&attacker, &ids);
     }
 
 }
