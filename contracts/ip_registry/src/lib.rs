@@ -57,6 +57,24 @@ pub enum ContractError {
     ArbitrationNotFound = 21,
     ArbitrationAlreadyFinalized = 22,
     NotAnArbitrator = 23,
+    /// #450: Nullifier already used (double-spend prevention).
+    NullifierAlreadyUsed = 24,
+    /// #450: Anonymity set not found.
+    AnonymitySetNotFound = 25,
+    /// #451: No IP IDs provided for batch revocation.
+    EmptyBatchRevocation = 26,
+    /// #452: Verification condition not met.
+    ConditionNotMet = 27,
+    /// #452: No condition set for this IP.
+    NoConditionSet = 28,
+    /// #453: Escrow already exists for this IP.
+    EscrowAlreadyExists = 29,
+    /// #453: Escrow not found for this IP.
+    EscrowNotFound = 30,
+    /// #453: Escrow conditions not met.
+    EscrowConditionsNotMet = 31,
+    /// #453: Only escrow owner can act.
+    NotEscrowOwner = 32,
 }
 
 // ── TTL ───────────────────────────────────────────────────────────────────────
@@ -101,6 +119,10 @@ pub enum DataKey {
     EncryptionKeyRotation(u64), // Issue #434: stores rotation history for a given ip_id
     NotaryPublicKey,        // Issue #428: stores the trusted notary Ed25519 public key (32 bytes)
     CommitmentHashes,       // Issue #429: stores Vec<BytesN<32>> of all commitment hashes for rollback protection
+    AnonymousCommitment(BytesN<32>), // Issue #450: maps nullifier -> AnonymousCommitmentRecord
+    AnonymitySet(BytesN<32>),        // Issue #450: maps set_id -> Vec<BytesN<32>> of commitment hashes
+    ConditionalVerification(u64),    // Issue #452: maps ip_id -> VerificationCondition
+    IpEscrow(u64),                   // Issue #453: maps ip_id -> EscrowRecord
 }
 
 // ── Types ────────────────────────────────────────────────────────────────────
@@ -193,6 +215,41 @@ pub struct ArbitrationRecord {
     pub votes_challenger: u32,
     pub finalized: bool,
     pub winner: Option<Address>,
+}
+
+/// Issue #450: Anonymous commitment record using ZK-style nullifier.
+/// The nullifier prevents double-spending while keeping the owner anonymous.
+#[contracttype]
+#[derive(Clone)]
+pub struct AnonymousCommitmentRecord {
+    pub nullifier: BytesN<32>,      // unique nullifier derived from secret + nonce
+    pub commitment_hash: BytesN<32>, // the actual commitment hash
+    pub anonymity_set_id: BytesN<32>, // which anonymity set this belongs to
+    pub timestamp: u64,
+}
+
+/// Issue #452: Condition that must be met before a commitment can be verified.
+#[contracttype]
+#[derive(Clone, Debug, PartialEq)]
+pub enum VerificationCondition {
+    /// Verification only allowed after this ledger timestamp.
+    TimeAfter(u64),
+    /// Verification only allowed before this ledger timestamp.
+    TimeBefore(u64),
+    /// Always verifiable (no condition).
+    None,
+}
+
+/// Issue #453: Escrow record holding a commitment until conditions are met.
+#[contracttype]
+#[derive(Clone)]
+pub struct EscrowRecord {
+    pub ip_id: u64,
+    pub owner: Address,
+    pub beneficiary: Address,
+    pub release_condition: VerificationCondition, // reuse condition type
+    pub released: bool,
+    pub timestamp: u64,
 }
 
 // ── Contract ─────────────────────────────────────────────────────────────────
@@ -2742,6 +2799,335 @@ impl IpRegistry {
             .persistent()
             .get(&DataKey::ArbitrationCase(arbitration_id))
             .unwrap_or_else(|| panic_with_error!(&env, ContractError::ArbitrationNotFound))
+    }
+
+    // ── Issue #450: Anonymous IP Commitment ───────────────────────────────────
+
+    /// Commit an IP anonymously using a ZK-style nullifier.
+    ///
+    /// The nullifier is a unique value derived from the secret and a nonce,
+    /// preventing double-spend while keeping the owner's identity hidden.
+    /// The commitment is added to the specified anonymity set.
+    ///
+    /// # Arguments
+    /// * `nullifier` - Unique value derived from secret + nonce (prevents double-spend)
+    /// * `commitment_hash` - The actual IP commitment hash
+    /// * `anonymity_set_id` - Which anonymity set to join (groups commitments for privacy)
+    ///
+    /// # Returns
+    /// The nullifier used (for reference).
+    pub fn commit_ip_anonymous(
+        env: Env,
+        nullifier: BytesN<32>,
+        commitment_hash: BytesN<32>,
+        anonymity_set_id: BytesN<32>,
+    ) -> BytesN<32> {
+        // Reject zero nullifier
+        let zero = BytesN::from_array(&env, &[0u8; 32]);
+        if nullifier == zero {
+            panic_with_error!(&env, ContractError::ZeroCommitmentHash);
+        }
+
+        // Reject zero commitment hash
+        let zero_hash = BytesN::from_array(&env, &[0u8; 32]);
+        if commitment_hash == zero_hash {
+            panic_with_error!(&env, ContractError::ZeroCommitmentHash);
+        }
+
+        // Prevent nullifier reuse (double-spend protection)
+        if env.storage().persistent().has(&DataKey::AnonymousCommitment(nullifier.clone())) {
+            panic_with_error!(&env, ContractError::NullifierAlreadyUsed);
+        }
+
+        let record = AnonymousCommitmentRecord {
+            nullifier: nullifier.clone(),
+            commitment_hash: commitment_hash.clone(),
+            anonymity_set_id: anonymity_set_id.clone(),
+            timestamp: env.ledger().timestamp(),
+        };
+
+        env.storage().persistent().set(&DataKey::AnonymousCommitment(nullifier.clone()), &record);
+        env.storage().persistent().extend_ttl(&DataKey::AnonymousCommitment(nullifier.clone()), LEDGER_BUMP, LEDGER_BUMP);
+
+        // Add to anonymity set
+        let mut set: soroban_sdk::Vec<BytesN<32>> = env
+            .storage()
+            .persistent()
+            .get(&DataKey::AnonymitySet(anonymity_set_id.clone()))
+            .unwrap_or(soroban_sdk::Vec::new(&env));
+        set.push_back(commitment_hash.clone());
+        env.storage().persistent().set(&DataKey::AnonymitySet(anonymity_set_id.clone()), &set);
+        env.storage().persistent().extend_ttl(&DataKey::AnonymitySet(anonymity_set_id.clone()), LEDGER_BUMP, LEDGER_BUMP);
+
+        env.events().publish(
+            (symbol_short!("anon_cmt"), anonymity_set_id),
+            (nullifier.clone(), env.ledger().timestamp()),
+        );
+
+        nullifier
+    }
+
+    /// Get an anonymous commitment record by nullifier.
+    pub fn get_anonymous_commitment(env: Env, nullifier: BytesN<32>) -> AnonymousCommitmentRecord {
+        env.storage()
+            .persistent()
+            .get(&DataKey::AnonymousCommitment(nullifier.clone()))
+            .unwrap_or_else(|| panic_with_error!(&env, ContractError::IpNotFound))
+    }
+
+    /// Get all commitment hashes in an anonymity set.
+    pub fn get_anonymity_set(env: Env, anonymity_set_id: BytesN<32>) -> soroban_sdk::Vec<BytesN<32>> {
+        env.storage()
+            .persistent()
+            .get(&DataKey::AnonymitySet(anonymity_set_id.clone()))
+            .unwrap_or_else(|| panic_with_error!(&env, ContractError::AnonymitySetNotFound))
+    }
+
+    /// Check if a nullifier has been used (double-spend check).
+    pub fn is_nullifier_used(env: Env, nullifier: BytesN<32>) -> bool {
+        env.storage().persistent().has(&DataKey::AnonymousCommitment(nullifier))
+    }
+
+    // ── Issue #451: Batch Revocation ──────────────────────────────────────────
+
+    /// Revoke multiple IP commitments in a single transaction.
+    ///
+    /// All IPs must be owned by the same owner who authorizes the transaction.
+    /// Already-revoked IPs are skipped (no panic). Returns the count of newly revoked IPs.
+    ///
+    /// # Arguments
+    /// * `owner` - The owner of all IPs (must authorize)
+    /// * `ip_ids` - Vector of IP IDs to revoke
+    ///
+    /// # Returns
+    /// Number of IPs successfully revoked in this call.
+    pub fn batch_revoke_ip(env: Env, owner: Address, ip_ids: soroban_sdk::Vec<u64>) -> u32 {
+        owner.require_auth();
+
+        if ip_ids.is_empty() {
+            panic_with_error!(&env, ContractError::EmptyBatchRevocation);
+        }
+
+        let mut revoked_count: u32 = 0;
+        let timestamp = env.ledger().timestamp();
+
+        for ip_id in ip_ids.iter() {
+            let mut record = require_ip_exists(&env, ip_id);
+
+            // Only revoke IPs owned by the caller; skip already-revoked
+            if record.owner != owner || record.revoked {
+                continue;
+            }
+
+            record.revoked = true;
+            env.storage().persistent().set(&DataKey::IpRecord(ip_id), &record);
+            env.storage().persistent().extend_ttl(&DataKey::IpRecord(ip_id), LEDGER_BUMP, LEDGER_BUMP);
+
+            env.events().publish(
+                (symbol_short!("revoke"), owner.clone()),
+                (ip_id, timestamp),
+            );
+
+            revoked_count += 1;
+        }
+
+        revoked_count
+    }
+
+    // ── Issue #452: Conditional Verification ─────────────────────────────────
+
+    /// Set a verification condition on an IP commitment.
+    ///
+    /// Once set, `verify_commitment_conditional` will enforce the condition
+    /// before allowing verification. Only the IP owner can set conditions.
+    ///
+    /// # Arguments
+    /// * `ip_id` - The IP to set the condition on
+    /// * `condition` - The condition that must be met for verification
+    pub fn set_verification_condition(env: Env, ip_id: u64, condition: VerificationCondition) {
+        let record = require_ip_exists(&env, ip_id);
+        record.owner.require_auth();
+
+        env.storage().persistent().set(&DataKey::ConditionalVerification(ip_id), &condition);
+        env.storage().persistent().extend_ttl(&DataKey::ConditionalVerification(ip_id), LEDGER_BUMP, LEDGER_BUMP);
+
+        env.events().publish(
+            (symbol_short!("cond_set"), record.owner),
+            ip_id,
+        );
+    }
+
+    /// Get the verification condition for an IP.
+    pub fn get_verification_condition(env: Env, ip_id: u64) -> VerificationCondition {
+        env.storage()
+            .persistent()
+            .get(&DataKey::ConditionalVerification(ip_id))
+            .unwrap_or(VerificationCondition::None)
+    }
+
+    /// Verify a commitment only if the set condition is met.
+    ///
+    /// Checks the condition first, then delegates to the standard commitment
+    /// verification logic. Returns false if condition is not met.
+    ///
+    /// # Arguments
+    /// * `ip_id` - The IP to verify
+    /// * `secret` - The secret used in the commitment
+    /// * `blinding_factor` - The blinding factor used in the commitment
+    pub fn verify_commitment_conditional(
+        env: Env,
+        ip_id: u64,
+        secret: BytesN<32>,
+        blinding_factor: BytesN<32>,
+    ) -> bool {
+        let condition: VerificationCondition = env
+            .storage()
+            .persistent()
+            .get(&DataKey::ConditionalVerification(ip_id))
+            .unwrap_or(VerificationCondition::None);
+
+        let now = env.ledger().timestamp();
+
+        match condition {
+            VerificationCondition::TimeAfter(unlock_time) => {
+                if now < unlock_time {
+                    panic_with_error!(&env, ContractError::ConditionNotMet);
+                }
+            }
+            VerificationCondition::TimeBefore(deadline) => {
+                if now >= deadline {
+                    panic_with_error!(&env, ContractError::ConditionNotMet);
+                }
+            }
+            VerificationCondition::None => {}
+        }
+
+        // Delegate to standard verification
+        Self::verify_commitment(env, ip_id, secret, blinding_factor)
+    }
+
+    // ── Issue #453: IP Commitment Escrow ──────────────────────────────────────
+
+    /// Place an IP commitment into escrow until a release condition is met.
+    ///
+    /// The IP is held in escrow and can only be released to the beneficiary
+    /// once the condition is satisfied. Only the IP owner can place it in escrow.
+    ///
+    /// # Arguments
+    /// * `ip_id` - The IP to place in escrow
+    /// * `beneficiary` - Address that receives the IP when conditions are met
+    /// * `release_condition` - Condition that must be met to release the escrow
+    pub fn place_in_escrow(
+        env: Env,
+        ip_id: u64,
+        beneficiary: Address,
+        release_condition: VerificationCondition,
+    ) {
+        let record = require_ip_exists(&env, ip_id);
+        record.owner.require_auth();
+
+        if env.storage().persistent().has(&DataKey::IpEscrow(ip_id)) {
+            panic_with_error!(&env, ContractError::EscrowAlreadyExists);
+        }
+
+        let escrow = EscrowRecord {
+            ip_id,
+            owner: record.owner.clone(),
+            beneficiary: beneficiary.clone(),
+            release_condition,
+            released: false,
+            timestamp: env.ledger().timestamp(),
+        };
+
+        env.storage().persistent().set(&DataKey::IpEscrow(ip_id), &escrow);
+        env.storage().persistent().extend_ttl(&DataKey::IpEscrow(ip_id), LEDGER_BUMP, LEDGER_BUMP);
+
+        env.events().publish(
+            (symbol_short!("escrow"), record.owner),
+            (ip_id, beneficiary),
+        );
+    }
+
+    /// Release an escrowed IP to the beneficiary if the condition is met.
+    ///
+    /// Checks the release condition and, if satisfied, transfers the IP
+    /// to the beneficiary. Anyone can call this once conditions are met.
+    ///
+    /// # Arguments
+    /// * `ip_id` - The IP to release from escrow
+    pub fn release_escrow(env: Env, ip_id: u64) {
+        let mut escrow: EscrowRecord = env
+            .storage()
+            .persistent()
+            .get(&DataKey::IpEscrow(ip_id))
+            .unwrap_or_else(|| panic_with_error!(&env, ContractError::EscrowNotFound));
+
+        if escrow.released {
+            panic_with_error!(&env, ContractError::IpAlreadyRevoked); // reuse "already done" error
+        }
+
+        let now = env.ledger().timestamp();
+
+        match escrow.release_condition.clone() {
+            VerificationCondition::TimeAfter(unlock_time) => {
+                if now < unlock_time {
+                    panic_with_error!(&env, ContractError::EscrowConditionsNotMet);
+                }
+            }
+            VerificationCondition::TimeBefore(deadline) => {
+                if now >= deadline {
+                    panic_with_error!(&env, ContractError::EscrowConditionsNotMet);
+                }
+            }
+            VerificationCondition::None => {}
+        }
+
+        escrow.released = true;
+        env.storage().persistent().set(&DataKey::IpEscrow(ip_id), &escrow);
+        env.storage().persistent().extend_ttl(&DataKey::IpEscrow(ip_id), LEDGER_BUMP, LEDGER_BUMP);
+
+        // Transfer IP to beneficiary
+        Self::transfer_ip(env.clone(), ip_id, escrow.beneficiary.clone());
+
+        env.events().publish(
+            (symbol_short!("esc_rel"), escrow.beneficiary.clone()),
+            ip_id,
+        );
+    }
+
+    /// Cancel an escrow and return control to the original owner.
+    ///
+    /// Only the original owner can cancel an escrow that has not yet been released.
+    ///
+    /// # Arguments
+    /// * `ip_id` - The IP whose escrow to cancel
+    pub fn cancel_escrow(env: Env, ip_id: u64) {
+        let escrow: EscrowRecord = env
+            .storage()
+            .persistent()
+            .get(&DataKey::IpEscrow(ip_id))
+            .unwrap_or_else(|| panic_with_error!(&env, ContractError::EscrowNotFound));
+
+        escrow.owner.require_auth();
+
+        if escrow.released {
+            panic_with_error!(&env, ContractError::EscrowConditionsNotMet);
+        }
+
+        env.storage().persistent().remove(&DataKey::IpEscrow(ip_id));
+
+        env.events().publish(
+            (symbol_short!("esc_can"), escrow.owner),
+            ip_id,
+        );
+    }
+
+    /// Get the escrow record for an IP.
+    pub fn get_escrow(env: Env, ip_id: u64) -> EscrowRecord {
+        env.storage()
+            .persistent()
+            .get(&DataKey::IpEscrow(ip_id))
+            .unwrap_or_else(|| panic_with_error!(&env, ContractError::EscrowNotFound))
     }
 }
 

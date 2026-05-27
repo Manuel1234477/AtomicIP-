@@ -510,3 +510,173 @@ See [TTL_MANAGEMENT.md](../TTL_MANAGEMENT.md) for details.
 - [Commitment Scheme](commitment-scheme.md) — How to construct valid commitment hashes
 - [Atomic Swap Flow](atomic-swap.md) — How to sell IP using atomic swaps
 - [Security Considerations](security.md) — Best practices for secret management
+
+---
+
+## Issue #450: Anonymous IP Commitment
+
+### `commit_ip_anonymous`
+
+Commit an IP anonymously using a ZK-style nullifier. The owner's identity is not stored — only the nullifier and commitment hash are recorded.
+
+```rust
+pub fn commit_ip_anonymous(
+    env: Env,
+    nullifier: BytesN<32>,
+    commitment_hash: BytesN<32>,
+    anonymity_set_id: BytesN<32>,
+) -> BytesN<32>
+```
+
+| Parameter | Type | Description |
+|---|---|---|
+| `nullifier` | `BytesN<32>` | Unique value derived from `sha256(secret \|\| nonce)` — prevents double-spend |
+| `commitment_hash` | `BytesN<32>` | The IP commitment hash |
+| `anonymity_set_id` | `BytesN<32>` | Group ID for the anonymity set this commitment joins |
+
+**Returns:** The nullifier (for reference).
+
+**Errors:** `ZeroCommitmentHash` (2) if either input is zero. `NullifierAlreadyUsed` (24) if the nullifier was already submitted.
+
+### `get_anonymous_commitment`
+
+```rust
+pub fn get_anonymous_commitment(env: Env, nullifier: BytesN<32>) -> AnonymousCommitmentRecord
+```
+
+Retrieve an anonymous commitment record by its nullifier.
+
+### `get_anonymity_set`
+
+```rust
+pub fn get_anonymity_set(env: Env, anonymity_set_id: BytesN<32>) -> Vec<BytesN<32>>
+```
+
+Returns all commitment hashes in the given anonymity set.
+
+### `is_nullifier_used`
+
+```rust
+pub fn is_nullifier_used(env: Env, nullifier: BytesN<32>) -> bool
+```
+
+Returns `true` if the nullifier has already been used (double-spend check).
+
+---
+
+## Issue #451: Batch Revocation
+
+### `batch_revoke_ip`
+
+Revoke multiple IP commitments in a single transaction. Already-revoked IPs and IPs not owned by the caller are silently skipped.
+
+```rust
+pub fn batch_revoke_ip(env: Env, owner: Address, ip_ids: Vec<u64>) -> u32
+```
+
+| Parameter | Type | Description |
+|---|---|---|
+| `owner` | `Address` | Owner of the IPs — must authorize the transaction |
+| `ip_ids` | `Vec<u64>` | List of IP IDs to revoke |
+
+**Returns:** Number of IPs newly revoked in this call.
+
+**Errors:** `EmptyBatchRevocation` (26) if `ip_ids` is empty.
+
+**Authorization:** Requires `owner.require_auth()`.
+
+---
+
+## Issue #452: Conditional Verification
+
+### `set_verification_condition`
+
+Set a condition that must be met before an IP commitment can be verified.
+
+```rust
+pub fn set_verification_condition(env: Env, ip_id: u64, condition: VerificationCondition)
+```
+
+| Condition Variant | Description |
+|---|---|
+| `VerificationCondition::None` | No restriction — always verifiable |
+| `VerificationCondition::TimeAfter(u64)` | Only verifiable after the given ledger timestamp |
+| `VerificationCondition::TimeBefore(u64)` | Only verifiable before the given ledger timestamp |
+
+**Authorization:** Requires the IP owner to authorize.
+
+### `get_verification_condition`
+
+```rust
+pub fn get_verification_condition(env: Env, ip_id: u64) -> VerificationCondition
+```
+
+Returns the current condition for an IP. Returns `VerificationCondition::None` if none is set.
+
+### `verify_commitment_conditional`
+
+```rust
+pub fn verify_commitment_conditional(
+    env: Env,
+    ip_id: u64,
+    secret: BytesN<32>,
+    blinding_factor: BytesN<32>,
+) -> bool
+```
+
+Verifies the commitment only if the set condition is satisfied. Panics with `ConditionNotMet` (27) if the condition fails.
+
+---
+
+## Issue #453: IP Commitment Escrow
+
+### `place_in_escrow`
+
+Place an IP commitment into escrow. The IP will be transferred to the beneficiary once the release condition is met.
+
+```rust
+pub fn place_in_escrow(
+    env: Env,
+    ip_id: u64,
+    beneficiary: Address,
+    release_condition: VerificationCondition,
+)
+```
+
+| Parameter | Type | Description |
+|---|---|---|
+| `ip_id` | `u64` | The IP to escrow |
+| `beneficiary` | `Address` | Recipient when conditions are met |
+| `release_condition` | `VerificationCondition` | Condition for release (use `None` for immediate release) |
+
+**Errors:** `EscrowAlreadyExists` (29) if an escrow already exists for this IP.
+
+**Authorization:** Requires the IP owner to authorize.
+
+### `release_escrow`
+
+```rust
+pub fn release_escrow(env: Env, ip_id: u64)
+```
+
+Releases the escrowed IP to the beneficiary if the release condition is met. Anyone can call this once conditions are satisfied.
+
+**Errors:** `EscrowNotFound` (30), `EscrowConditionsNotMet` (31).
+
+### `cancel_escrow`
+
+```rust
+pub fn cancel_escrow(env: Env, ip_id: u64)
+```
+
+Cancels the escrow and returns control to the original owner. Only the original owner can cancel.
+
+**Authorization:** Requires the original escrow owner to authorize.
+
+### `get_escrow`
+
+```rust
+pub fn get_escrow(env: Env, ip_id: u64) -> EscrowRecord
+```
+
+Returns the escrow record for an IP. Panics with `EscrowNotFound` (30) if none exists.

@@ -1,1 +1,11 @@
 target/
+test_snapshots/
+*.snap
+*.snap.new
+**/__snapshots__/
+.env
+*.log
+*.tmp
+node_modules/
+.DS_Store
+Thumbs.db
