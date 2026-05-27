@@ -48,6 +48,7 @@ mod tests {
         fn commit_ip_version(env: Env, owner: Address, commitment_hash: BytesN<32>, parent_ip_id: u64) -> u64;
         // Issue #432
         fn batch_verify_commitments(env: Env, verifications: Vec<(u64, BytesN<32>, BytesN<32>)>) -> Vec<bool>;
+        fn batch_commit_ip_anonymous(env: Env, blinded_owner: BytesN<32>, commitment_hashes: Vec<BytesN<32>>) -> Vec<u64>;
         // Issue #433
         fn issue_ownership_challenge(env: Env, ip_id: u64, challenger: Address, nonce: BytesN<32>) -> u64;
         fn respond_to_ownership_challenge(env: Env, challenge_id: u64, response_hash: BytesN<32>);
@@ -664,6 +665,41 @@ mod tests {
         for i in 0..5 {
             assert_eq!(ids.get(i).unwrap(), (i + 1) as u64);
         }
+    }
+
+    #[test]
+    fn test_batch_commit_ip_anonymous_creates_records() {
+        let env = Env::default();
+        // Anonymous commits do not require caller auth
+        let contract_id = env.register(crate::IpRegistry, ());
+        let client = IpRegistryClient::new(&env, &contract_id);
+
+        // Create anonymous commitment hashes
+        let commitment1 = BytesN::from_array(&env, &[11u8; 32]);
+        let commitment2 = BytesN::from_array(&env, &[12u8; 32]);
+        let mut hashes: Vec<BytesN<32>> = Vec::new(&env);
+        hashes.push_back(commitment1.clone());
+        hashes.push_back(commitment2.clone());
+
+        // Blinded owner identifier (off-chain proof pointer)
+        let blinded_owner = BytesN::from_array(&env, &[7u8; 32]);
+
+        // Call anonymous batch commit
+        let ids = client.batch_commit_ip_anonymous(&blinded_owner, &hashes);
+
+        assert_eq!(ids.len(), 2);
+
+        // Verify records exist and contain expected commitment hashes
+        let rec1 = client.get_ip(&ids.get(0).unwrap());
+        let rec2 = client.get_ip(&ids.get(1).unwrap());
+
+        assert_eq!(rec1.commitment_hash, commitment1);
+        assert_eq!(rec2.commitment_hash, commitment2);
+
+        // Ensure anonymous commits did not populate owner index for a random owner
+        let random_owner = <Address as TestAddress>::generate(&env);
+        let listed = client.list_ip_by_owner(&random_owner);
+        assert_eq!(listed.len(), 0);
     }
 
     #[test]

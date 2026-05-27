@@ -128,6 +128,34 @@ let ip_ids = registry.batch_commit_ip(&owner, &hashes);
 
 ---
 
+## `batch_commit_ip_anonymous`
+
+Commit multiple IP hashes anonymously in a single transaction. The contract stores a blinded owner identifier alongside each commitment; the on-chain `owner` field is set to the contract address to avoid exposing the submitter.
+
+### Signature
+
+```rust
+pub fn batch_commit_ip_anonymous(env: Env, blinded_owner: BytesN<32>, hashes: Vec<BytesN<32>>) -> Vec<u64>
+```
+
+### Parameters
+
+| Parameter | Type | Description |
+|---|---|---|
+| `env` | `Env` | Soroban environment |
+| `blinded_owner` | `BytesN<32>` | Off-chain blinded owner identifier (e.g. sha256(owner || nonce)) |
+| `hashes` | `Vec<BytesN<32>>` | Vector of commitment hashes to register anonymously |
+
+### Returns
+
+`Vec<u64>` — Vector of assigned sequential IP IDs.
+
+### Notes
+
+- Anonymous commits do not populate the owner index and therefore do not appear in `list_ip_by_owner` for the real owner.
+- The contract records the blinded owner using a dedicated storage key so ownership can be proved or revealed later.
+
+
 ## `get_ip`
 
 Retrieve an IP record by ID.
