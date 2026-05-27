@@ -51,6 +51,12 @@ pub enum ContractError {
     OnlyOwnerCanManageCoOwners = 15,
     DisputeNotFound = 16,
     DisputeAlreadyResolved = 17,
+    StakeNotFound = 18,
+    AlreadyStaked = 19,
+    StakeAlreadySlashed = 20,
+    ArbitrationNotFound = 21,
+    ArbitrationAlreadyFinalized = 22,
+    NotAnArbitrator = 23,
 }
 
 // ── TTL ───────────────────────────────────────────────────────────────────────
@@ -153,6 +159,39 @@ pub struct DisputeRecord {
     pub evidence_hash: BytesN<32>,
     pub timestamp: u64,
     pub resolved: bool,
+    pub winner: Option<Address>,
+}
+
+/// Issue #447: Stake record for an IP commitment.
+#[contracttype]
+#[derive(Clone)]
+pub struct StakeRecord {
+    pub ip_id: u64,
+    pub owner: Address,
+    pub amount: i128,
+    pub slashed: bool,
+}
+
+/// Issue #448: Reputation record for an IP owner.
+#[contracttype]
+#[derive(Clone)]
+pub struct ReputationRecord {
+    pub owner: Address,
+    pub score: i64,       // can go negative after slashing
+    pub commitments: u64, // total successful commitments
+    pub disputes_lost: u64,
+}
+
+/// Issue #449: Arbitration case for a dispute.
+#[contracttype]
+#[derive(Clone)]
+pub struct ArbitrationRecord {
+    pub arbitration_id: u64,
+    pub dispute_id: u64,
+    pub arbitrators: soroban_sdk::Vec<Address>,
+    pub votes_owner: u32,
+    pub votes_challenger: u32,
+    pub finalized: bool,
     pub winner: Option<Address>,
 }
 
@@ -2401,6 +2440,308 @@ impl IpRegistry {
             .persistent()
             .get(&DataKey::IpDisputes(dispute_id))
             .unwrap_or_else(|| panic_with_error!(&env, ContractError::DisputeNotFound))
+    }
+
+    // ── Issue #447: IP Commitment Staking ─────────────────────────────────────
+
+    /// Stake XLM (represented as an i128 amount) against an IP commitment.
+    /// Only the IP owner may stake. One active stake per IP.
+    pub fn stake_commitment(env: Env, ip_id: u64, amount: i128) {
+        let record = require_ip_exists(&env, ip_id);
+        record.owner.require_auth();
+
+        if env.storage().persistent().has(&DataKey::IpStake(ip_id)) {
+            panic_with_error!(&env, ContractError::AlreadyStaked);
+        }
+
+        let stake = StakeRecord {
+            ip_id,
+            owner: record.owner.clone(),
+            amount,
+            slashed: false,
+        };
+        env.storage().persistent().set(&DataKey::IpStake(ip_id), &stake);
+        env.storage().persistent().extend_ttl(&DataKey::IpStake(ip_id), LEDGER_BUMP, LEDGER_BUMP);
+
+        env.events().publish((symbol_short!("staked"), record.owner), (ip_id, amount));
+    }
+
+    /// Slash the stake for an IP (admin-only). Marks the stake as slashed and
+    /// decrements the owner's reputation score.
+    pub fn slash_stake(env: Env, ip_id: u64) {
+        let admin: Address = env
+            .storage()
+            .persistent()
+            .get(&DataKey::Admin)
+            .unwrap_or_else(|| panic_with_error!(&env, ContractError::Unauthorized));
+        admin.require_auth();
+
+        let mut stake: StakeRecord = env
+            .storage()
+            .persistent()
+            .get(&DataKey::IpStake(ip_id))
+            .unwrap_or_else(|| panic_with_error!(&env, ContractError::StakeNotFound));
+
+        if stake.slashed {
+            panic_with_error!(&env, ContractError::StakeAlreadySlashed);
+        }
+
+        stake.slashed = true;
+        env.storage().persistent().set(&DataKey::IpStake(ip_id), &stake);
+        env.storage().persistent().extend_ttl(&DataKey::IpStake(ip_id), LEDGER_BUMP, LEDGER_BUMP);
+
+        // Penalise reputation
+        let mut rep: ReputationRecord = env
+            .storage()
+            .persistent()
+            .get(&DataKey::OwnerReputation(stake.owner.clone()))
+            .unwrap_or(ReputationRecord {
+                owner: stake.owner.clone(),
+                score: 0,
+                commitments: 0,
+                disputes_lost: 0,
+            });
+        rep.score = rep.score.saturating_sub(10);
+        rep.disputes_lost += 1;
+        env.storage().persistent().set(&DataKey::OwnerReputation(stake.owner.clone()), &rep);
+        env.storage().persistent().extend_ttl(&DataKey::OwnerReputation(stake.owner.clone()), LEDGER_BUMP, LEDGER_BUMP);
+
+        env.events().publish((symbol_short!("slashed"), stake.owner), ip_id);
+    }
+
+    /// Unstake: remove an active (non-slashed) stake. Owner-only.
+    pub fn unstake(env: Env, ip_id: u64) {
+        let stake: StakeRecord = env
+            .storage()
+            .persistent()
+            .get(&DataKey::IpStake(ip_id))
+            .unwrap_or_else(|| panic_with_error!(&env, ContractError::StakeNotFound));
+
+        stake.owner.require_auth();
+
+        if stake.slashed {
+            panic_with_error!(&env, ContractError::StakeAlreadySlashed);
+        }
+
+        env.storage().persistent().remove(&DataKey::IpStake(ip_id));
+        env.events().publish((symbol_short!("unstaked"), stake.owner), ip_id);
+    }
+
+    /// Get the stake record for an IP.
+    pub fn get_stake(env: Env, ip_id: u64) -> Option<StakeRecord> {
+        env.storage().persistent().get(&DataKey::IpStake(ip_id))
+    }
+
+    // ── Issue #448: IP Commitment Reputation System ───────────────────────────
+
+    /// Get the reputation record for an owner. Returns a default record if none exists.
+    pub fn get_reputation(env: Env, owner: Address) -> ReputationRecord {
+        env.storage()
+            .persistent()
+            .get(&DataKey::OwnerReputation(owner.clone()))
+            .unwrap_or(ReputationRecord {
+                owner,
+                score: 0,
+                commitments: 0,
+                disputes_lost: 0,
+            })
+    }
+
+    /// Increment the commitment count and score for an owner (called internally on commit).
+    /// Also callable by admin to manually adjust reputation.
+    pub fn update_reputation(env: Env, owner: Address, score_delta: i64) {
+        let admin: Address = env
+            .storage()
+            .persistent()
+            .get(&DataKey::Admin)
+            .unwrap_or_else(|| panic_with_error!(&env, ContractError::Unauthorized));
+        admin.require_auth();
+
+        let mut rep: ReputationRecord = env
+            .storage()
+            .persistent()
+            .get(&DataKey::OwnerReputation(owner.clone()))
+            .unwrap_or(ReputationRecord {
+                owner: owner.clone(),
+                score: 0,
+                commitments: 0,
+                disputes_lost: 0,
+            });
+        rep.score = rep.score.saturating_add(score_delta);
+        env.storage().persistent().set(&DataKey::OwnerReputation(owner.clone()), &rep);
+        env.storage().persistent().extend_ttl(&DataKey::OwnerReputation(owner), LEDGER_BUMP, LEDGER_BUMP);
+    }
+
+    // ── Issue #449: IP Commitment Dispute Arbitration ─────────────────────────
+
+    /// Nominate an address as an arbitrator (admin-only).
+    pub fn nominate_arbitrator(env: Env, arbitrator: Address) {
+        let admin: Address = env
+            .storage()
+            .persistent()
+            .get(&DataKey::Admin)
+            .unwrap_or_else(|| panic_with_error!(&env, ContractError::Unauthorized));
+        admin.require_auth();
+
+        let mut pool: Vec<Address> = env
+            .storage()
+            .persistent()
+            .get(&DataKey::ArbitratorPool)
+            .unwrap_or(Vec::new(&env));
+
+        // Idempotent: skip if already in pool
+        for a in pool.iter() {
+            if a == arbitrator {
+                return;
+            }
+        }
+        pool.push_back(arbitrator.clone());
+        env.storage().persistent().set(&DataKey::ArbitratorPool, &pool);
+        env.storage().persistent().extend_ttl(&DataKey::ArbitratorPool, LEDGER_BUMP, LEDGER_BUMP);
+
+        env.events().publish((symbol_short!("arb_nom"), admin), arbitrator);
+    }
+
+    /// Open an arbitration case for an existing dispute. Admin-only.
+    /// Returns the new arbitration_id.
+    pub fn open_arbitration(env: Env, dispute_id: u64) -> u64 {
+        let admin: Address = env
+            .storage()
+            .persistent()
+            .get(&DataKey::Admin)
+            .unwrap_or_else(|| panic_with_error!(&env, ContractError::Unauthorized));
+        admin.require_auth();
+
+        // Ensure dispute exists
+        let _dispute: DisputeRecord = env
+            .storage()
+            .persistent()
+            .get(&DataKey::IpDisputes(dispute_id))
+            .unwrap_or_else(|| panic_with_error!(&env, ContractError::DisputeNotFound));
+
+        let arb_id: u64 = env
+            .storage()
+            .persistent()
+            .get(&DataKey::NextArbitrationId)
+            .unwrap_or(1);
+
+        let pool: Vec<Address> = env
+            .storage()
+            .persistent()
+            .get(&DataKey::ArbitratorPool)
+            .unwrap_or(Vec::new(&env));
+
+        let case = ArbitrationRecord {
+            arbitration_id: arb_id,
+            dispute_id,
+            arbitrators: pool,
+            votes_owner: 0,
+            votes_challenger: 0,
+            finalized: false,
+            winner: None,
+        };
+
+        env.storage().persistent().set(&DataKey::ArbitrationCase(arb_id), &case);
+        env.storage().persistent().extend_ttl(&DataKey::ArbitrationCase(arb_id), LEDGER_BUMP, LEDGER_BUMP);
+        env.storage().persistent().set(&DataKey::NextArbitrationId, &(arb_id + 1));
+        env.storage().persistent().extend_ttl(&DataKey::NextArbitrationId, LEDGER_BUMP, LEDGER_BUMP);
+
+        arb_id
+    }
+
+    /// Cast a vote on an arbitration case. `vote_for_owner = true` votes for the
+    /// IP owner; `false` votes for the challenger. Caller must be a nominated arbitrator.
+    pub fn vote_on_dispute(env: Env, arbitration_id: u64, voter: Address, vote_for_owner: bool) {
+        voter.require_auth();
+
+        let mut case: ArbitrationRecord = env
+            .storage()
+            .persistent()
+            .get(&DataKey::ArbitrationCase(arbitration_id))
+            .unwrap_or_else(|| panic_with_error!(&env, ContractError::ArbitrationNotFound));
+
+        if case.finalized {
+            panic_with_error!(&env, ContractError::ArbitrationAlreadyFinalized);
+        }
+
+        // Verify voter is in the arbitrator pool
+        let mut is_arbitrator = false;
+        for a in case.arbitrators.iter() {
+            if a == voter {
+                is_arbitrator = true;
+                break;
+            }
+        }
+        if !is_arbitrator {
+            panic_with_error!(&env, ContractError::NotAnArbitrator);
+        }
+
+        if vote_for_owner {
+            case.votes_owner += 1;
+        } else {
+            case.votes_challenger += 1;
+        }
+
+        env.storage().persistent().set(&DataKey::ArbitrationCase(arbitration_id), &case);
+        env.storage().persistent().extend_ttl(&DataKey::ArbitrationCase(arbitration_id), LEDGER_BUMP, LEDGER_BUMP);
+
+        env.events().publish((symbol_short!("arb_vote"), voter), (arbitration_id, vote_for_owner));
+    }
+
+    /// Finalize an arbitration case. Admin-only. Determines winner by majority vote
+    /// and resolves the underlying dispute.
+    pub fn finalize_arbitration(env: Env, arbitration_id: u64) {
+        let admin: Address = env
+            .storage()
+            .persistent()
+            .get(&DataKey::Admin)
+            .unwrap_or_else(|| panic_with_error!(&env, ContractError::Unauthorized));
+        admin.require_auth();
+
+        let mut case: ArbitrationRecord = env
+            .storage()
+            .persistent()
+            .get(&DataKey::ArbitrationCase(arbitration_id))
+            .unwrap_or_else(|| panic_with_error!(&env, ContractError::ArbitrationNotFound));
+
+        if case.finalized {
+            panic_with_error!(&env, ContractError::ArbitrationAlreadyFinalized);
+        }
+
+        let mut dispute: DisputeRecord = env
+            .storage()
+            .persistent()
+            .get(&DataKey::IpDisputes(case.dispute_id))
+            .unwrap_or_else(|| panic_with_error!(&env, ContractError::DisputeNotFound));
+
+        let ip_record = require_ip_exists(&env, dispute.ip_id);
+
+        // Majority vote determines winner; ties go to the IP owner
+        let winner = if case.votes_challenger > case.votes_owner {
+            dispute.challenger.clone()
+        } else {
+            ip_record.owner.clone()
+        };
+
+        case.finalized = true;
+        case.winner = Some(winner.clone());
+        dispute.resolved = true;
+        dispute.winner = Some(winner.clone());
+
+        env.storage().persistent().set(&DataKey::ArbitrationCase(arbitration_id), &case);
+        env.storage().persistent().extend_ttl(&DataKey::ArbitrationCase(arbitration_id), LEDGER_BUMP, LEDGER_BUMP);
+        env.storage().persistent().set(&DataKey::IpDisputes(case.dispute_id), &dispute);
+        env.storage().persistent().extend_ttl(&DataKey::IpDisputes(case.dispute_id), LEDGER_BUMP, LEDGER_BUMP);
+
+        env.events().publish((symbol_short!("arb_fin"), winner.clone()), arbitration_id);
+    }
+
+    /// Get an arbitration case by ID.
+    pub fn get_arbitration(env: Env, arbitration_id: u64) -> ArbitrationRecord {
+        env.storage()
+            .persistent()
+            .get(&DataKey::ArbitrationCase(arbitration_id))
+            .unwrap_or_else(|| panic_with_error!(&env, ContractError::ArbitrationNotFound))
     }
 }
 
