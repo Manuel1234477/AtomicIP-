@@ -93,6 +93,14 @@ pub enum DataKey {
     OwnershipChallenge(u64), // Issue #433: stores OwnershipChallenge for a given challenge_id
     NextChallengeId,         // Issue #433: monotonic challenge ID counter
     EncryptionKeyRotation(u64), // Issue #434: stores rotation history for a given ip_id
+    CompressedCommitment(u64),  // Issue #438: stores compressed (16-byte) commitment hash
+    ShardIps(u32),              // Issue #437: stores Vec<u64> of IP IDs in a given shard
+    IpAuditTrail(u64),          // Issue #436: stores Vec<AuditEntry> for a given ip_id
+    IpDisputes(u64),            // stores DisputeRecord for a given dispute_id
+    NextDisputeId,              // monotonic dispute ID counter
+    Snapshot(u64),              // stores CommitmentSnapshot for a given snapshot_id
+    NextSnapshotId,             // monotonic snapshot ID counter
+    CommitmentChecksumV2,       // stores checksum computed over all active commitment hashes
 }
 
 // ── Types ────────────────────────────────────────────────────────────────────
@@ -152,6 +160,16 @@ pub struct DisputeRecord {
     pub timestamp: u64,
     pub resolved: bool,
     pub winner: Option<Address>,
+}
+
+/// A periodic snapshot of all active commitment hashes for disaster recovery.
+#[contracttype]
+#[derive(Clone)]
+pub struct CommitmentSnapshot {
+    pub snapshot_id: u64,
+    pub timestamp: u64,
+    pub total_count: u64,
+    pub checksum: BytesN<32>,
 }
 
 // ── Contract ─────────────────────────────────────────────────────────────────
@@ -2223,6 +2241,62 @@ impl IpRegistry {
             .persistent()
             .get(&DataKey::IpDisputes(dispute_id))
             .unwrap_or_else(|| panic_with_error!(&env, ContractError::DisputeNotFound))
+    }
+
+    // ── Issue: Cleanup Expired/Revoked Commitments ────────────────────────────────────────
+
+    /// Remove a revoked IP record from storage to free ledger space.
+    ///
+    /// Only the owner may clean up their own revoked record. The commitment
+    /// owner index entry is also removed. Returns the ip_id that was cleaned.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the IP does not exist, the caller is not the owner, or the IP
+    /// is not revoked.
+    pub fn cleanup_revoked_commitment(env: Env, ip_id: u64) {
+        let record = require_ip_exists(&env, ip_id);
+        record.owner.require_auth();
+        require_is_revoked(&env, &record);
+
+        env.storage().persistent().remove(&DataKey::IpRecord(ip_id));
+        env.storage()
+            .persistent()
+            .remove(&DataKey::CommitmentOwner(record.commitment_hash.clone()));
+
+        let mut ids: Vec<u64> = env
+            .storage()
+            .persistent()
+            .get(&DataKey::OwnerIps(record.owner.clone()))
+            .unwrap_or(Vec::new(&env));
+        if let Some(pos) = ids.iter().position(|x| x == ip_id) {
+            ids.remove(pos as u32);
+        }
+        env.storage()
+            .persistent()
+            .set(&DataKey::OwnerIps(record.owner.clone()), &ids);
+        env.storage()
+            .persistent()
+            .extend_ttl(&DataKey::OwnerIps(record.owner.clone()), LEDGER_BUMP, LEDGER_BUMP);
+
+        env.events().publish(
+            (symbol_short!("cleanup"), record.owner),
+            ip_id,
+        );
+    }
+}
+
+
+/// Validates that the IP has been revoked (required before cleanup).
+///
+/// # Panics
+///
+/// Panics with `IpAlreadyRevoked` (reused semantics) if the IP is not revoked.
+fn require_is_revoked(env: &Env, record: &IpRecord) {
+    if !record.revoked {
+        env.panic_with_error(soroban_sdk::Error::from_contract_error(
+            ContractError::IpNotFound as u32,
+        ));
     }
 }
 

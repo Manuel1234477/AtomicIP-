@@ -60,6 +60,11 @@ mod tests {
         fn generate_merkle_proof(env: Env, ip_id: u64) -> Vec<BytesN<32>>;
         fn compute_ip_merkle_root(env: Env, owner: Address) -> BytesN<32>;
         fn verify_ip_merkle_proof(env: Env, ip_id: u64, proof: Vec<BytesN<32>>) -> bool;
+        fn cleanup_revoked_commitment(env: Env, ip_id: u64);
+        fn initiate_dispute(env: Env, ip_id: u64, challenger: Address, evidence_hash: BytesN<32>) -> u64;
+        fn submit_dispute_evidence(env: Env, dispute_id: u64, submitter: Address, evidence_hash: BytesN<32>);
+        fn resolve_dispute(env: Env, dispute_id: u64, winner: Address);
+        fn get_dispute(env: Env, dispute_id: u64) -> crate::DisputeRecord;
     }
 
     #[test]
@@ -1544,4 +1549,40 @@ mod tests {
         });
         assert!(found, "dispute event must be emitted; dispute_id={dispute_id}");
     }
+    // ── Issue: Cleanup Expired/Revoked Commitments ────────────────────────────────────────
+
+    #[test]
+    fn test_cleanup_revoked_commitment_removes_record() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let contract_id = env.register(crate::IpRegistry, ());
+        let client = IpRegistryClient::new(&env, &contract_id);
+
+        let owner = <Address as TestAddress>::generate(&env);
+        let hash = BytesN::from_array(&env, &[0xC1u8; 32]);
+        let ip_id = client.commit_ip(&owner, &hash, &0u32);
+
+        client.revoke_ip(&ip_id);
+        client.cleanup_revoked_commitment(&ip_id);
+
+        let ids = client.list_ip_by_owner(&owner);
+        assert!(!ids.iter().any(|x| x == ip_id));
+    }
+
+    #[test]
+    #[should_panic]
+    fn test_cleanup_non_revoked_panics() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let contract_id = env.register(crate::IpRegistry, ());
+        let client = IpRegistryClient::new(&env, &contract_id);
+
+        let owner = <Address as TestAddress>::generate(&env);
+        let hash = BytesN::from_array(&env, &[0xC2u8; 32]);
+        let ip_id = client.commit_ip(&owner, &hash, &0u32);
+
+        // Not revoked — must panic
+        client.cleanup_revoked_commitment(&ip_id);
+    }
+
 }
