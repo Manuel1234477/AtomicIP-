@@ -70,6 +70,10 @@ mod tests {
         fn get_ip_lineage(env: Env, ip_id: u64) -> Vec<u64>;
         fn get_ip_version_chain(env: Env, ip_id: u64) -> Vec<u64>;
         fn check_expiration_warning(env: Env, ip_id: u64, warning_threshold_ledgers: u32) -> bool;
+        fn grant_ip_access(env: Env, ip_id: u64, grantee: Address, access_level: u32);
+        fn revoke_ip_access(env: Env, ip_id: u64, grantee: Address);
+        fn get_ip_access_grants(env: Env, ip_id: u64) -> Vec<crate::IpAccessGrant>;
+        fn check_ip_access(env: Env, ip_id: u64, grantee: Address, required_level: u32) -> bool;
     }
 
     #[test]
