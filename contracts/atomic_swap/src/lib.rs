@@ -59,6 +59,7 @@ pub enum ContractError {
     NotAllSigned = 42,
     AlreadySigned = 43,
     NotARequiredSigner = 44,
+    RollbackWindowExpired = 45,
 }
 
 // ── TTL ───────────────────────────────────────────────────────────────────────
@@ -141,6 +142,8 @@ pub enum DataKey {
     SwapSigners(u64),
     /// Maps swap_id → Vec<Address> of signers who have already signed off.
     SwapSignatures(u64),
+    /// Maps swap_id → ledger timestamp when the swap reached Completed.
+    CompletionTimestamp(u64),
 }
 
 // ── Types ─────────────────────────────────────────────────────────────────────
@@ -557,6 +560,11 @@ impl AtomicSwap {
 
         swap.status = SwapStatus::Completed;
         swap::save_swap(&env, swap_id, &swap);
+
+        // Record completion timestamp for rollback window
+        let completion_ts = env.ledger().timestamp();
+        env.storage().persistent().set(&DataKey::CompletionTimestamp(swap_id), &completion_ts);
+        env.storage().persistent().extend_ttl(&DataKey::CompletionTimestamp(swap_id), LEDGER_BUMP, LEDGER_BUMP);
 
         // Release the IP lock
         env.storage()
@@ -2950,6 +2958,63 @@ impl AtomicSwap {
             (soroban_sdk::symbol_short!("esc_wdr"),),
             SwapCancelledEvent { swap_id, canceller: swap.buyer },
         );
+    }
+
+    // ── Rollback ──────────────────────────────────────────────────────────────
+
+    /// Buyer-only. Within 24 hours of swap completion, the buyer can call this
+    /// with `is_key_valid = false` to trigger a partial refund if the decryption
+    /// key turned out to be invalid. 90% of the payment is refunded to the buyer;
+    /// 10% is sent to the treasury as a penalty. Returns `true` if rolled back,
+    /// `false` if the key was reported valid (no action taken).
+    pub fn validate_and_rollback_swap(env: Env, swap_id: u64, is_key_valid: bool) -> bool {
+        let mut swap = require_swap_exists(&env, swap_id);
+        swap.buyer.require_auth();
+
+        require_swap_status(&env, &swap, SwapStatus::Completed, ContractError::NotInAccepted);
+
+        // Enforce 24-hour rollback window
+        let completion_ts: u64 = env
+            .storage()
+            .persistent()
+            .get(&DataKey::CompletionTimestamp(swap_id))
+            .unwrap_or(0);
+        let elapsed = env.ledger().timestamp().saturating_sub(completion_ts);
+        if elapsed > 86_400 {
+            env.panic_with_error(Error::from_contract_error(
+                ContractError::RollbackWindowExpired as u32,
+            ));
+        }
+
+        if is_key_valid {
+            return false;
+        }
+
+        // 90% refund to buyer, 10% penalty to treasury
+        let buyer_refund = swap.price * 90 / 100;
+        let treasury_penalty = swap.price - buyer_refund;
+
+        let config = Self::protocol_config(&env);
+        let token_client = token::Client::new(&env, &swap.token);
+
+        token_client.transfer(&env.current_contract_address(), &swap.buyer, &buyer_refund);
+        if treasury_penalty > 0 {
+            token_client.transfer(&env.current_contract_address(), &config.treasury, &treasury_penalty);
+        }
+
+        swap.status = SwapStatus::RolledBack;
+        swap::save_swap(&env, swap_id, &swap);
+
+        env.storage().persistent().remove(&DataKey::CompletionTimestamp(swap_id));
+
+        Self::append_history(&env, swap_id, SwapStatus::RolledBack);
+
+        env.events().publish(
+            (soroban_sdk::symbol_short!("rollback"),),
+            SwapRolledBackEvent { swap_id, buyer_refund, treasury_penalty },
+        );
+
+        true
     }
 
     // ── Multi-party reveal (co-inventor sign-off) ─────────────────────────────
