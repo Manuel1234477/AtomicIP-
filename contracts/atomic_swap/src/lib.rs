@@ -2906,6 +2906,70 @@ impl AtomicSwap {
         swap_ids
     }
 
+    /// Arbitrate multiple disputed swaps in one call. Arbitrator-only.
+    /// `refund` applies uniformly to all swaps in the batch.
+    pub fn batch_arbitrate_swaps(env: Env, swap_ids: Vec<u64>, arbitrator: Address, refund: bool) {
+        arbitrator.require_auth();
+
+        for swap_id in swap_ids.iter() {
+            let mut swap = require_swap_exists(&env, swap_id);
+            require_swap_status(&env, &swap, SwapStatus::Disputed, ContractError::NotDisputed);
+
+            let token_client = token::Client::new(&env, &swap.token);
+
+            if refund {
+                token_client.transfer(&env.current_contract_address(), &swap.buyer, &swap.price);
+
+                if swap.collateral_amount > 0 {
+                    if let Some(collateral) = env
+                        .storage()
+                        .persistent()
+                        .get::<_, i128>(&DataKey::SwapCollateral(swap_id))
+                    {
+                        token_client.transfer(&env.current_contract_address(), &swap.buyer, &collateral);
+                        env.storage().persistent().remove(&DataKey::SwapCollateral(swap_id));
+                    }
+                }
+
+                swap.status = SwapStatus::Cancelled;
+            } else {
+                let config = Self::protocol_config(&env);
+                let fee_amount = if config.protocol_fee_bps > 0 && swap.price > 0 {
+                    (swap.price * config.protocol_fee_bps as i128) / 10000
+                } else {
+                    0
+                };
+                let seller_amount = swap.price - fee_amount;
+                token_client.transfer(&env.current_contract_address(), &swap.seller, &seller_amount);
+                if fee_amount > 0 {
+                    token_client.transfer(&env.current_contract_address(), &config.treasury, &fee_amount);
+                }
+
+                if swap.collateral_amount > 0 {
+                    if let Some(collateral) = env
+                        .storage()
+                        .persistent()
+                        .get::<_, i128>(&DataKey::SwapCollateral(swap_id))
+                    {
+                        token_client.transfer(&env.current_contract_address(), &swap.seller, &collateral);
+                        env.storage().persistent().remove(&DataKey::SwapCollateral(swap_id));
+                    }
+                }
+
+                swap.status = SwapStatus::Completed;
+            }
+
+            swap::save_swap(&env, swap_id, &swap);
+            env.storage().persistent().remove(&DataKey::ActiveSwap(swap.ip_id));
+            Self::append_history(&env, swap_id, swap.status.clone());
+
+            env.events().publish(
+                (soroban_sdk::symbol_short!("arb_dec"),),
+                ArbitratedEvent { swap_id, arbitrator: arbitrator.clone(), refunded: refund },
+            );
+        }
+    }
+
     // ── #358: Swap Timeout Escalation ─────────────────────────────────────────
 
     /// Request timeout escalation. Buyer-only. Extends deadline if timeout imminent.
