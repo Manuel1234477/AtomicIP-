@@ -60,6 +60,9 @@ pub enum ContractError {
     AlreadySigned = 43,
     NotARequiredSigner = 44,
     RollbackWindowExpired = 45,
+    BatchEmpty = 46,
+    BatchSizeMismatch = 47,
+    BatchTooLarge = 48,
 }
 
 // ── TTL ───────────────────────────────────────────────────────────────────────
@@ -67,6 +70,9 @@ pub enum ContractError {
 /// Minimum ledger TTL bump applied to every persistent storage write.
 /// ~1 year at ~5s per ledger: 365 * 24 * 3600 / 5 ≈ 6_307_200 ledgers.
 pub const LEDGER_BUMP: u32 = 6_307_200;
+
+/// Maximum number of items allowed in a single batch operation.
+pub const MAX_BATCH_SIZE: u32 = 50;
 
 // ── Storage Keys ──────────────────────────────────────────────────────────────
 
@@ -1569,6 +1575,18 @@ impl AtomicSwap {
         seller.require_auth();
 
         let len = ip_ids.len();
+
+        // #520: Validate batch parameters upfront
+        if len == 0 {
+            env.panic_with_error(Error::from_contract_error(ContractError::BatchEmpty as u32));
+        }
+        if prices.len() != len {
+            env.panic_with_error(Error::from_contract_error(ContractError::BatchSizeMismatch as u32));
+        }
+        if len > MAX_BATCH_SIZE {
+            env.panic_with_error(Error::from_contract_error(ContractError::BatchTooLarge as u32));
+        }
+
         let mut swap_ids: Vec<u64> = Vec::new(&env);
 
         for i in 0..len {
@@ -2620,6 +2638,14 @@ impl AtomicSwap {
         require_not_paused(&env);
         buyer.require_auth();
 
+        // #520: Validate batch parameters upfront
+        if swap_ids.is_empty() {
+            env.panic_with_error(Error::from_contract_error(ContractError::BatchEmpty as u32));
+        }
+        if swap_ids.len() > MAX_BATCH_SIZE {
+            env.panic_with_error(Error::from_contract_error(ContractError::BatchTooLarge as u32));
+        }
+
         for swap_id in swap_ids.iter() {
             let mut swap = require_swap_exists(&env, swap_id);
 
@@ -2707,10 +2733,15 @@ impl AtomicSwap {
     ) {
         seller.require_auth();
 
-        if swap_ids.len() != secrets.len() || swap_ids.len() != blinding_factors.len() {
-            env.panic_with_error(Error::from_contract_error(
-                ContractError::InvalidKey as u32,
-            ));
+        // #520: Validate batch parameters upfront
+        if swap_ids.is_empty() {
+            env.panic_with_error(Error::from_contract_error(ContractError::BatchEmpty as u32));
+        }
+        if secrets.len() != swap_ids.len() || blinding_factors.len() != swap_ids.len() {
+            env.panic_with_error(Error::from_contract_error(ContractError::BatchSizeMismatch as u32));
+        }
+        if swap_ids.len() > MAX_BATCH_SIZE {
+            env.panic_with_error(Error::from_contract_error(ContractError::BatchTooLarge as u32));
         }
 
         for i in 0..swap_ids.len() {
