@@ -3093,6 +3093,8 @@ impl AtomicSwap {
                 escrow_agent: None,
                 quantity: 1,
                 conditions: Vec::new(&env),
+                paid_amount: 0,
+                is_installment: false,
             };
 
             env.storage().persistent().set(&DataKey::Swap(id), &swap);
@@ -3135,6 +3137,50 @@ impl AtomicSwap {
         }
 
         swap_ids
+    }
+
+    /// Buyer deposits funds into multiple escrow-mode swaps in one call.
+    /// Each swap must be in `Pending` status with `SwapMode::Escrow`.
+    pub fn batch_escrow_deposit(env: Env, swap_ids: Vec<u64>, buyer: Address) {
+        buyer.require_auth();
+
+        for swap_id in swap_ids.iter() {
+            let mut swap = require_swap_exists(&env, swap_id);
+
+            if swap.buyer != buyer {
+                env.panic_with_error(Error::from_contract_error(ContractError::Unauthorized as u32));
+            }
+
+            let mode: SwapMode = env
+                .storage()
+                .persistent()
+                .get(&DataKey::SwapMode(swap_id))
+                .unwrap_or(SwapMode::Atomic);
+            if mode != SwapMode::Escrow {
+                env.panic_with_error(Error::from_contract_error(ContractError::Unauthorized as u32));
+            }
+
+            require_swap_status(&env, &swap, SwapStatus::Pending, ContractError::NotPending);
+
+            token::Client::new(&env, &swap.token).transfer(
+                &swap.buyer,
+                &env.current_contract_address(),
+                &swap.price,
+            );
+
+            env.storage().persistent().set(&DataKey::EscrowDeposit(swap_id), &swap.price);
+            env.storage().persistent().extend_ttl(&DataKey::EscrowDeposit(swap_id), LEDGER_BUMP, LEDGER_BUMP);
+
+            swap.accept_timestamp = env.ledger().timestamp();
+            swap.status = SwapStatus::Accepted;
+            swap::save_swap(&env, swap_id, &swap);
+            Self::append_history(&env, swap_id, SwapStatus::Accepted);
+
+            env.events().publish(
+                (soroban_sdk::symbol_short!("esc_dep"),),
+                SwapAcceptedEvent { swap_id, buyer: swap.buyer },
+            );
+        }
     }
 
     /// Buyer deposits funds into escrow. Moves swap to `Accepted`.
@@ -3335,6 +3381,8 @@ impl AtomicSwap {
             escrow_agent: None,
             quantity: 1,
             conditions: Vec::new(&env),
+            paid_amount: 0,
+            is_installment: false,
         };
 
         env.storage().persistent().set(&DataKey::Swap(id), &swap);
@@ -3490,6 +3538,9 @@ impl AtomicSwap {
 
 // #[cfg(test)]
 // mod upgrade_chaos_tests;
+
+#[cfg(test)]
+mod batch_swap_features_tests;
 
 #[cfg(test)]
 mod installment_tests {
