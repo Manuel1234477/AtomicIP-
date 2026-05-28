@@ -1569,11 +1569,52 @@ impl AtomicSwap {
         seller.require_auth();
 
         let len = ip_ids.len();
-        let mut swap_ids: Vec<u64> = Vec::new(&env);
 
+        // #524: Deduplicate ip_ids, preserving the first occurrence and its corresponding price.
+        let mut seen: Vec<u64> = Vec::new(&env);
+        let mut dedup_ip_ids: Vec<u64> = Vec::new(&env);
+        let mut dedup_prices: Vec<i128> = Vec::new(&env);
         for i in 0..len {
             let ip_id = ip_ids.get(i).unwrap();
-            let price = prices.get(i).unwrap();
+            let mut already_seen = false;
+            for j in 0..seen.len() {
+                if seen.get(j).unwrap() == ip_id {
+                    already_seen = true;
+                    break;
+                }
+            }
+            if !already_seen {
+                seen.push_back(ip_id);
+                dedup_ip_ids.push_back(ip_id);
+                dedup_prices.push_back(prices.get(i).unwrap());
+            }
+        }
+
+        // #523: Compute fingerprint over deduplicated (ip_id, price) pairs for idempotency.
+        let mut preimage = Bytes::new(&env);
+        for i in 0..dedup_ip_ids.len() {
+            let ip_id = dedup_ip_ids.get(i).unwrap();
+            let price = dedup_prices.get(i).unwrap();
+            preimage.append(&Bytes::from_array(&env, &ip_id.to_be_bytes()));
+            preimage.append(&Bytes::from_array(&env, &price.to_be_bytes()));
+        }
+        let fingerprint: BytesN<32> = env.crypto().sha256(&preimage).into();
+
+        // #523: Return cached result if this exact deduplicated batch was already submitted.
+        if let Some(cached) = env
+            .storage()
+            .temporary()
+            .get::<DataKey, Vec<u64>>(&DataKey::BatchSwapResult(fingerprint.clone()))
+        {
+            return cached;
+        }
+
+        let dedup_len = dedup_ip_ids.len();
+        let mut swap_ids: Vec<u64> = Vec::new(&env);
+
+        for i in 0..dedup_len {
+            let ip_id = dedup_ip_ids.get(i).unwrap();
+            let price = dedup_prices.get(i).unwrap();
 
             require_positive_price(&env, price);
             registry::ensure_seller_owns_active_ip(&env, ip_id, &seller);
@@ -1581,27 +1622,27 @@ impl AtomicSwap {
 
             let id: u64 = env.storage().instance().get(&DataKey::NextId).unwrap_or(0);
 
-                        let swap = SwapRecord {
-                            ip_id,
-                            seller: seller.clone(),
-                            buyer: buyer.clone(),
-                            price,
-                            token: token.clone(),
-                            status: SwapStatus::Pending,
-                            expiry: env.ledger().timestamp() + 604800u64,
-                            accept_timestamp: 0,
-                            required_approvals,
-                            dispute_timestamp: 0,
-                            referrer: referrer.clone(),
-                            collateral_amount: 0,
-                            insurance_premium: 0,
-                            insurance_enabled: false,
-                            escrow_agent: None,
-                            quantity: 1,
-                            conditions: Vec::new(&env),
-            paid_amount: 0,
-            is_installment: false,
-                        };
+            let swap = SwapRecord {
+                ip_id,
+                seller: seller.clone(),
+                buyer: buyer.clone(),
+                price,
+                token: token.clone(),
+                status: SwapStatus::Pending,
+                expiry: env.ledger().timestamp() + 604800u64,
+                accept_timestamp: 0,
+                required_approvals,
+                dispute_timestamp: 0,
+                referrer: referrer.clone(),
+                collateral_amount: 0,
+                insurance_premium: 0,
+                insurance_enabled: false,
+                escrow_agent: None,
+                quantity: 1,
+                conditions: Vec::new(&env),
+                paid_amount: 0,
+                is_installment: false,
+            };
 
             env.storage().persistent().set(&DataKey::Swap(id), &swap);
             env.storage().persistent().extend_ttl(&DataKey::Swap(id), LEDGER_BUMP, LEDGER_BUMP);
@@ -1635,6 +1676,15 @@ impl AtomicSwap {
 
             swap_ids.push_back(id);
         }
+
+        // #523: Cache result in temporary storage (~7 days TTL at ~5 s/ledger).
+        let idempotency_ttl: u32 = 120_960;
+        env.storage()
+            .temporary()
+            .set(&DataKey::BatchSwapResult(fingerprint.clone()), &swap_ids);
+        env.storage()
+            .temporary()
+            .extend_ttl(&DataKey::BatchSwapResult(fingerprint), idempotency_ttl, idempotency_ttl);
 
         swap_ids
     }
