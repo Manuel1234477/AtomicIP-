@@ -3853,6 +3853,73 @@ impl AtomicSwap {
         env.storage().persistent().extend_ttl(&DataKey::SwapSignatures(swap_id), LEDGER_BUMP, LEDGER_BUMP);
     }
 
+    /// Sign off on multiple swaps in a single call. The `signer` must be a
+    /// required co-signer on every swap in `swap_ids`. Each swap must be in
+    /// `Accepted` state and the signer must not have already signed it.
+    /// Equivalent to calling `sign_swap_reveal` for each swap_id individually.
+    pub fn batch_sign_swap_reveal(env: Env, swap_ids: Vec<u64>, signer: Address) {
+        signer.require_auth();
+
+        for i in 0..swap_ids.len() {
+            let swap_id = swap_ids.get(i).unwrap();
+            let swap = require_swap_exists(&env, swap_id);
+            require_swap_status(&env, &swap, SwapStatus::Accepted, ContractError::NotAccepted);
+
+            let signers: Vec<Address> = env
+                .storage()
+                .persistent()
+                .get(&DataKey::SwapSigners(swap_id))
+                .unwrap_or_else(|| {
+                    env.panic_with_error(Error::from_contract_error(
+                        ContractError::Unauthorized as u32,
+                    ))
+                });
+
+            let mut is_required = false;
+            for j in 0..signers.len() {
+                if signers.get(j).unwrap() == signer {
+                    is_required = true;
+                    break;
+                }
+            }
+            if !is_required {
+                env.panic_with_error(Error::from_contract_error(
+                    ContractError::NotARequiredSigner as u32,
+                ));
+            }
+
+            let mut signed: Vec<Address> = env
+                .storage()
+                .persistent()
+                .get(&DataKey::SwapSignatures(swap_id))
+                .unwrap_or(Vec::new(&env));
+
+            for j in 0..signed.len() {
+                if signed.get(j).unwrap() == signer {
+                    env.panic_with_error(Error::from_contract_error(
+                        ContractError::AlreadySigned as u32,
+                    ));
+                }
+            }
+
+            signed.push_back(signer.clone());
+            env.storage()
+                .persistent()
+                .set(&DataKey::SwapSignatures(swap_id), &signed);
+            env.storage()
+                .persistent()
+                .extend_ttl(&DataKey::SwapSignatures(swap_id), LEDGER_BUMP, LEDGER_BUMP);
+        }
+
+        env.events().publish(
+            (soroban_sdk::symbol_short!("btch_sgn"),),
+            BatchSignedEvent {
+                swap_ids,
+                signer,
+            },
+        );
+    }
+
     // ── Reputation ────────────────────────────────────────────────────────────
 
     /// Returns the reputation score (0–100) for an address. Defaults to 50.
