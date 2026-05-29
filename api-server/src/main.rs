@@ -28,6 +28,7 @@ mod health;
 mod compression;
 mod validation;
 mod response;
+mod docs;
 
 #[derive(OpenApi)]
 #[openapi(

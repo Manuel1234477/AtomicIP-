@@ -49,3 +49,4 @@ pub mod health;
 pub mod compression;
 pub mod validation;
 pub mod response;
+pub mod docs;
