@@ -26,6 +26,10 @@ mod request_signing;
 mod invariants;
 mod health;
 mod compression;
+mod load_balancer;
+mod middleware_pipeline;
+mod dependency_injection;
+mod rate_limit;
 
 #[derive(OpenApi)]
 #[openapi(
@@ -135,6 +139,7 @@ async fn main() {
     let app = Router::new()
         .merge(SwaggerUi::new("/docs").url("/openapi.json", ApiDoc::openapi()))
         .route("/health", get(health::health_handler))
+        .route("/health/detailed", get(health::detailed_health_handler))
         .route("/metrics", get(metrics::metrics_handler))
         .route("/graphql", post(graphql_handler))
         .route("/ws", get(ws_handler))
@@ -153,7 +158,8 @@ async fn main() {
         .route("/swap/{swap_id}/cancel-expired", post(handlers::cancel_expired_swap))
         .route("/swap/{swap_id}", get(handlers::get_swap))
         .with_state((schema, broadcaster.clone(), health_checker.clone()))
-        .layer(middleware::from_fn(metrics::track));
+        .layer(middleware::from_fn(metrics::track))
+        .layer(middleware::from_fn(middleware_pipeline::cors_middleware));
 
     let listener = tokio::net::TcpListener::bind("0.0.0.0:8080").await.unwrap();
     println!("Swagger UI   -> http://localhost:8080/docs");
