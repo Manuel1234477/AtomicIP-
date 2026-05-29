@@ -29,6 +29,7 @@ mod compression;
 mod validation;
 mod response;
 mod docs;
+mod sdk;
 
 #[derive(OpenApi)]
 #[openapi(
