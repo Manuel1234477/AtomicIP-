@@ -215,6 +215,55 @@ swap_contract.reveal_key(swap_id, secret, blinding_factor);
 
 ---
 
+## Batch Operations
+
+### #517: Batch Swap Cancellation
+
+Cancel multiple pending swaps in a single transaction with per-swap reason tracking.
+
+```rust
+let swap_ids = vec![1, 2, 3];
+let reasons = vec![
+    Bytes::from_slice(&env, b"no_longer_needed"),
+    Bytes::from_slice(&env, b"price_changed"),
+    Bytes::from_slice(&env, b"buyer_requested"),
+];
+let cancelled_ids = atomic_swap.batch_cancel_swaps(swap_ids, canceller, reasons);
+```
+
+**Constraints:**
+- `reasons.len()` must equal `swap_ids.len()` or the call panics with `InvalidKey`
+- Each swap must be in `Pending` state
+- The caller must be either the seller or buyer of each swap
+- Each swap receives its own `CancelReason` stored on-chain (retrievable via `get_cancellation_reason`)
+- The canceller's reputation is decreased by 10 points
+- A `BatchCancelledEvent` is emitted with `swap_ids`, `canceller`, and `reasons`
+
+**Returns:** A `Vec<u64>` of the successfully cancelled swap IDs.
+
+### #518: Batch Fee Breakdown
+
+When batch-revealing keys via `batch_reveal_keys`, the contract now emits a `BatchFeeBreakdownEvent` alongside the standard `BatchKeysRevealedEvent`. This event contains per-swap fee details:
+
+```rust
+pub struct SwapFeeBreakdown {
+    pub swap_id: u64,
+    pub price: i128,
+    pub protocol_fee: i128,
+    pub referral_fee: i128,
+    pub seller_amount: i128,
+}
+```
+
+The `BatchFeeBreakdownEvent` includes:
+- `swap_ids`: The list of swap IDs
+- `seller`: The seller's address
+- `fees`: A `Vec<SwapFeeBreakdown>` with fee details for each swap
+
+This allows off-chain indexers and frontends to display exact fee amounts per swap without replaying protocol fee logic.
+
+---
+
 ## Related Documentation
 
 - [Commitment Scheme](commitment-scheme.md) — How to construct valid secrets
@@ -223,80 +272,110 @@ swap_contract.reveal_key(swap_id, secret, blinding_factor);
 
 ---
 
-## Multi-Signer Swaps and Batch Verification
+## Batch Operations (#469)
 
-For high-value IP sales that require sign-off from multiple co-inventors or stakeholders, the contract supports a multi-signer reveal flow.
+Batch functions allow a seller or buyer to initiate, accept, or complete multiple swaps in a single transaction, reducing fees and round-trips.
 
-### Initiating a Multi-Signer Swap
+### batch_initiate_swap
+
+Seller initiates multiple patent sales at once. All swaps share the same buyer and payment token.
 
 ```rust
-let swap_id = atomic_swap.initiate_swap_with_signers(
-    token,
-    ip_id,
+let swap_ids: Vec<u64> = swap_contract.batch_initiate_swap(
+    token,       // Payment token (same for all swaps)
+    ip_ids,      // Vec of IP IDs to sell
+    seller,      // Seller address (requires auth)
+    prices,      // Vec of prices — prices[i] corresponds to ip_ids[i]
+    buyer,       // Buyer address
+    0,           // required_approvals (0 = none)
+    None,        // referrer
+);
+```
+
+**Constraints:**
+- `ip_ids.len() == prices.len()`
+- Seller must own every IP in `ip_ids`
+- No active swap may exist for any of the IPs
+- All prices must be > 0
+
+**Result:** Returns a `Vec<u64>` of the newly created swap IDs, one per IP.
+
+---
+
+### batch_accept_swaps
+
+Buyer accepts multiple Pending swaps in one call. Payment for each swap is transferred to the contract.
+
+```rust
+swap_contract.batch_accept_swaps(
+    swap_ids,  // Vec of swap IDs to accept
+    buyer,     // Buyer address (requires auth)
+);
+```
+
+**Constraints:**
+- Every swap must be in `Pending` state
+- `buyer` must match the `buyer` field on each swap
+- Required approvals (if any) must already be collected
+
+**Result:** All swaps move to `Accepted`. A single `BatchAccepted` event is emitted.
+
+---
+
+### batch_reveal_keys
+
+Seller reveals decryption keys for multiple Accepted swaps in one call. Each key is verified; payment is released per swap.
+
+```rust
+swap_contract.batch_reveal_keys(
+    swap_ids,         // Vec of swap IDs
+    secrets,          // Vec of secrets — secrets[i] for swap_ids[i]
+    blinding_factors, // Vec of blinding factors
+    seller,           // Seller address (requires auth)
+);
+```
+
+**Constraints:**
+- `swap_ids`, `secrets`, and `blinding_factors` must all have the same length
+- Every swap must be in `Accepted` state
+- Seller must be the initiator of every swap
+- Every `verify_commitment(ip_id, secret, blinding_factor)` must return `true`
+
+**Result:** All swaps move to `Completed`. Protocol fees are deducted per swap. A single `BatchKeysRevealed` event is emitted.
+
+---
+
+### Batch Flow Example
+
+```rust
+// 1. Seller lists three IPs for sale in one transaction
+let swap_ids = swap_contract.batch_initiate_swap(
+    xlm_token,
+    vec![ip_id_1, ip_id_2, ip_id_3],
     seller,
-    price,
+    vec![100_000_000, 200_000_000, 50_000_000],
     buyer,
-    signers, // Vec<Address> — all must sign before reveal_key is allowed
+    0,
+    None,
+);
+
+// 2. Buyer accepts all three (sends total payment in one call)
+swap_contract.batch_accept_swaps(swap_ids.clone(), buyer);
+
+// 3. Seller reveals all three keys (completes all swaps in one call)
+swap_contract.batch_reveal_keys(
+    swap_ids,
+    vec![secret_1, secret_2, secret_3],
+    vec![blinding_1, blinding_2, blinding_3],
+    seller,
 );
 ```
 
-The `signers` list must be non-empty. All addresses in the list must call `sign_swap_reveal` (or `batch_sign_swap_reveal`) before the seller can call `reveal_key`.
+### Events
 
-### Signing Off (Single Swap)
+| Event | Symbol | Emitted by |
+|---|---|---|
+| `BatchAcceptedEvent` | `btch_acp` | `batch_accept_swaps` |
+| `BatchKeysRevealedEvent` | `btch_key` | `batch_reveal_keys` |
 
-```rust
-atomic_swap.sign_swap_reveal(swap_id, signer);
-```
-
-- Swap must be in `Accepted` state.
-- `signer` must be in the required signers list.
-- Duplicate signatures are rejected.
-
-### Batch Signing (Multiple Swaps)
-
-A signer can approve multiple swaps in a single transaction:
-
-```rust
-atomic_swap.batch_sign_swap_reveal(swap_ids, signer);
-```
-
-- Applies the same checks as `sign_swap_reveal` for each swap.
-- Emits a `BatchSignedEvent { swap_ids, signer }`.
-- Fails atomically if any swap fails validation (wrong state, not a required signer, duplicate).
-
-### Querying Signature Status
-
-```rust
-let (signed_count, required_count) = atomic_swap.get_swap_signature_status(swap_id);
-```
-
-Returns `(0, 0)` for swaps with no multi-signer requirement.
-
-### Batch Reveal with Multi-Signer Guard
-
-`batch_reveal_keys` enforces the same multi-signer guard as `reveal_key` — if a swap has required signers, all must have signed before the batch reveal proceeds. Any swap in the batch that has unsigned signers will cause the entire batch call to fail.
-
-### Example: Two Co-Inventors
-
-```rust
-// Seller and co-inventor must both approve before reveal
-let mut signers = Vec::new(&env);
-signers.push_back(seller.clone());
-signers.push_back(co_inventor.clone());
-
-let swap_id = atomic_swap.initiate_swap_with_signers(
-    token, ip_id, seller, price, buyer, signers,
-);
-
-// Buyer accepts and sends payment
-atomic_swap.accept_swap(swap_id);
-
-// Both signers approve (can be done in one batch call)
-let mut ids = Vec::new(&env);
-ids.push_back(swap_id);
-atomic_swap.batch_sign_swap_reveal(ids.clone(), seller);
-atomic_swap.batch_sign_swap_reveal(ids, co_inventor);
-
-// Now reveal is unblocked
-atomic_swap.reveal_key(swap_id, seller, secret, blinding_factor);
-```
+Individual `SwapInitiatedEvent` events are still emitted per swap inside `batch_initiate_swap`.

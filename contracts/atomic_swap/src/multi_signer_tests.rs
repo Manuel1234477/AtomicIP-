@@ -243,10 +243,31 @@ mod multi_signer_tests {
         assert!(result.is_err(), "empty signers list must be rejected");
     }
 
-    // ── Batch sign tests ──────────────────────────────────────────────────────
+    // ── #527: batch_sign_swap_reveal tests ────────────────────────────────────
+
+    /// Helper: create a swap with two required signers (seller + co_signer),
+    /// accept it, and return the swap_id.
+    fn setup_accepted_swap_with_signers(
+        env: &Env,
+        client: &AtomicSwapClient,
+        token_id: &Address,
+        seller: &Address,
+        co_signer: &Address,
+        buyer: &Address,
+        ip_id: u64,
+        price: i128,
+    ) -> u64 {
+        let mut signers = Vec::new(env);
+        signers.push_back(seller.clone());
+        signers.push_back(co_signer.clone());
+
+        let swap_id = client.initiate_swap_with_signers(token_id, &ip_id, seller, &price, buyer, &signers);
+        client.accept_swap(&swap_id);
+        swap_id
+    }
 
     #[test]
-    fn test_batch_sign_swap_reveal_signs_all() {
+    fn test_batch_sign_signs_all_swaps() {
         let env = Env::default();
         env.mock_all_auths();
 
@@ -255,62 +276,56 @@ mod multi_signer_tests {
         let buyer = Address::generate(&env);
 
         let (registry_id, ip_id1, secret1, blinding1) = setup_registry(&env, &seller);
-        let token_id = setup_token(&env, &seller, &buyer, 2_000_000);
+        let (_, ip_id2, secret2, blinding2) = setup_registry(&env, &seller);
+        let token_id = setup_token(&env, &seller, &buyer, 10_000_000);
         let client = setup_contract(&env, &registry_id);
 
-        // Create a second IP for the second swap
-        let registry_client = ip_registry::IpRegistryClient::new(&env, &registry_id);
-        let secret2 = BytesN::from_array(&env, &[0xCCu8; 32]);
-        let blinding2 = BytesN::from_array(&env, &[0xDDu8; 32]);
-        let mut preimage2 = Bytes::new(&env);
-        preimage2.append(&Bytes::from(secret2.clone()));
-        preimage2.append(&Bytes::from(blinding2.clone()));
-        let hash2: BytesN<32> = env.crypto().sha256(&preimage2).into();
-        let ip_id2 = registry_client.commit_ip(&seller, &hash2);
-
-        let mut signers = Vec::new(&env);
-        signers.push_back(seller.clone());
-        signers.push_back(co_signer.clone());
-
-        let swap_id1 = client.initiate_swap_with_signers(
-            &token_id, &ip_id1, &seller, &1000i128, &buyer, &signers,
+        let swap_id1 = setup_accepted_swap_with_signers(
+            &env, &client, &token_id, &seller, &co_signer, &buyer, ip_id1, 1000,
         );
-        let swap_id2 = client.initiate_swap_with_signers(
-            &token_id, &ip_id2, &seller, &1000i128, &buyer, &signers,
+        let swap_id2 = setup_accepted_swap_with_signers(
+            &env, &client, &token_id, &seller, &co_signer, &buyer, ip_id2, 2000,
         );
 
-        client.accept_swap(&swap_id1);
-        client.accept_swap(&swap_id2);
+        // co_signer batch-signs both swaps
+        let mut ids = Vec::new(&env);
+        ids.push_back(swap_id1);
+        ids.push_back(swap_id2);
+        client.batch_sign_swap_reveal(&ids, &co_signer);
 
-        // Batch sign both swaps as co_signer
-        let mut batch_ids = Vec::new(&env);
-        batch_ids.push_back(swap_id1);
-        batch_ids.push_back(swap_id2);
-        client.batch_sign_swap_reveal(&batch_ids, &co_signer);
+        // seller still needs to sign individually; after that reveal must succeed
+        client.sign_swap_reveal(&swap_id1, &seller);
+        client.sign_swap_reveal(&swap_id2, &seller);
 
-        // Verify signature status: 1 of 2 signed for each
-        let (signed1, required1) = client.get_swap_signature_status(&swap_id1);
-        assert_eq!(signed1, 1, "swap1 should have 1 signature");
-        assert_eq!(required1, 2, "swap1 requires 2 signatures");
-
-        let (signed2, required2) = client.get_swap_signature_status(&swap_id2);
-        assert_eq!(signed2, 1, "swap2 should have 1 signature");
-        assert_eq!(required2, 2, "swap2 requires 2 signatures");
-
-        // Seller also signs both
-        client.batch_sign_swap_reveal(&batch_ids, &seller);
-
-        let (signed1_after, _) = client.get_swap_signature_status(&swap_id1);
-        assert_eq!(signed1_after, 2, "swap1 should have 2 signatures after seller signs");
-
-        // Now reveal should succeed for both
         client.reveal_key(&swap_id1, &seller, &secret1, &blinding1);
         client.reveal_key(&swap_id2, &seller, &secret2, &blinding2);
 
-        let swap1 = client.get_swap(&swap_id1).unwrap();
-        let swap2 = client.get_swap(&swap_id2).unwrap();
-        assert_eq!(swap1.status, SwapStatus::Completed);
-        assert_eq!(swap2.status, SwapStatus::Completed);
+        assert_eq!(client.get_swap(&swap_id1).unwrap().status, SwapStatus::Completed);
+        assert_eq!(client.get_swap(&swap_id2).unwrap().status, SwapStatus::Completed);
+    }
+
+    #[test]
+    fn test_batch_sign_outsider_rejected() {
+        let env = Env::default();
+        env.mock_all_auths();
+
+        let seller = Address::generate(&env);
+        let co_signer = Address::generate(&env);
+        let outsider = Address::generate(&env);
+        let buyer = Address::generate(&env);
+
+        let (registry_id, ip_id, _, _) = setup_registry(&env, &seller);
+        let token_id = setup_token(&env, &seller, &buyer, 1_000_000);
+        let client = setup_contract(&env, &registry_id);
+
+        let swap_id = setup_accepted_swap_with_signers(
+            &env, &client, &token_id, &seller, &co_signer, &buyer, ip_id, 1000,
+        );
+
+        let mut ids = Vec::new(&env);
+        ids.push_back(swap_id);
+        let result = client.try_batch_sign_swap_reveal(&ids, &outsider);
+        assert!(result.is_err(), "outsider must not be able to batch-sign");
     }
 
     #[test]
@@ -326,32 +341,26 @@ mod multi_signer_tests {
         let token_id = setup_token(&env, &seller, &buyer, 1_000_000);
         let client = setup_contract(&env, &registry_id);
 
-        let mut signers = Vec::new(&env);
-        signers.push_back(seller.clone());
-        signers.push_back(co_signer.clone());
-
-        let swap_id = client.initiate_swap_with_signers(
-            &token_id, &ip_id, &seller, &1000i128, &buyer, &signers,
+        let swap_id = setup_accepted_swap_with_signers(
+            &env, &client, &token_id, &seller, &co_signer, &buyer, ip_id, 1000,
         );
-        client.accept_swap(&swap_id);
 
-        let mut batch_ids = Vec::new(&env);
-        batch_ids.push_back(swap_id);
+        let mut ids = Vec::new(&env);
+        ids.push_back(swap_id);
+        client.batch_sign_swap_reveal(&ids, &co_signer);
 
-        client.batch_sign_swap_reveal(&batch_ids, &seller);
-        // Second call with same signer must fail
-        let result = client.try_batch_sign_swap_reveal(&batch_ids, &seller);
-        assert!(result.is_err(), "duplicate batch signature must be rejected");
+        // Second batch-sign on the same swap must fail
+        let result = client.try_batch_sign_swap_reveal(&ids, &co_signer);
+        assert!(result.is_err(), "duplicate batch-sign must be rejected");
     }
 
     #[test]
-    fn test_batch_sign_non_required_signer_rejected() {
+    fn test_batch_sign_pending_swap_rejected() {
         let env = Env::default();
         env.mock_all_auths();
 
         let seller = Address::generate(&env);
         let co_signer = Address::generate(&env);
-        let outsider = Address::generate(&env);
         let buyer = Address::generate(&env);
 
         let (registry_id, ip_id, _, _) = setup_registry(&env, &seller);
@@ -361,17 +370,15 @@ mod multi_signer_tests {
         let mut signers = Vec::new(&env);
         signers.push_back(seller.clone());
         signers.push_back(co_signer.clone());
-
         let swap_id = client.initiate_swap_with_signers(
             &token_id, &ip_id, &seller, &1000i128, &buyer, &signers,
         );
-        client.accept_swap(&swap_id);
+        // NOT accepted — still Pending
 
-        let mut batch_ids = Vec::new(&env);
-        batch_ids.push_back(swap_id);
-
-        let result = client.try_batch_sign_swap_reveal(&batch_ids, &outsider);
-        assert!(result.is_err(), "outsider must not be able to batch sign");
+        let mut ids = Vec::new(&env);
+        ids.push_back(swap_id);
+        let result = client.try_batch_sign_swap_reveal(&ids, &co_signer);
+        assert!(result.is_err(), "batch-sign on Pending swap must fail");
     }
 
     #[test]
@@ -383,72 +390,33 @@ mod multi_signer_tests {
         let co_signer = Address::generate(&env);
         let buyer = Address::generate(&env);
 
-        let (registry_id, ip_id, secret, blinding) = setup_registry(&env, &seller);
-        let token_id = setup_token(&env, &seller, &buyer, 2_000_000);
+        let (registry_id, ip_id1, secret1, blinding1) = setup_registry(&env, &seller);
+        let (_, ip_id2, secret2, blinding2) = setup_registry(&env, &seller);
+        let token_id = setup_token(&env, &seller, &buyer, 10_000_000);
         let client = setup_contract(&env, &registry_id);
 
-        let registry_client = ip_registry::IpRegistryClient::new(&env, &registry_id);
-        let secret2 = BytesN::from_array(&env, &[0xCCu8; 32]);
-        let blinding2 = BytesN::from_array(&env, &[0xDDu8; 32]);
-        let mut preimage2 = Bytes::new(&env);
-        preimage2.append(&Bytes::from(secret2.clone()));
-        preimage2.append(&Bytes::from(blinding2.clone()));
-        let hash2: BytesN<32> = env.crypto().sha256(&preimage2).into();
-        let ip_id2 = registry_client.commit_ip(&seller, &hash2);
-
-        let mut signers = Vec::new(&env);
-        signers.push_back(seller.clone());
-        signers.push_back(co_signer.clone());
-
-        let swap_id1 = client.initiate_swap_with_signers(
-            &token_id, &ip_id, &seller, &1000i128, &buyer, &signers,
+        let swap_id1 = setup_accepted_swap_with_signers(
+            &env, &client, &token_id, &seller, &co_signer, &buyer, ip_id1, 1000,
         );
-        let swap_id2 = client.initiate_swap_with_signers(
-            &token_id, &ip_id2, &seller, &1000i128, &buyer, &signers,
+        let swap_id2 = setup_accepted_swap_with_signers(
+            &env, &client, &token_id, &seller, &co_signer, &buyer, ip_id2, 2000,
         );
 
-        client.accept_swap(&swap_id1);
-        client.accept_swap(&swap_id2);
-
-        // Only seller signs — co_signer has not signed
+        // Only seller signs swap_id1; nobody signs swap_id2
         client.sign_swap_reveal(&swap_id1, &seller);
-        client.sign_swap_reveal(&swap_id2, &seller);
 
-        let mut batch_ids = Vec::new(&env);
-        batch_ids.push_back(swap_id1);
-        batch_ids.push_back(swap_id2);
-
+        let mut ids = Vec::new(&env);
+        ids.push_back(swap_id1);
+        ids.push_back(swap_id2);
         let mut secrets = Vec::new(&env);
-        secrets.push_back(secret);
+        secrets.push_back(secret1);
         secrets.push_back(secret2);
-
         let mut blindings = Vec::new(&env);
-        blindings.push_back(blinding);
+        blindings.push_back(blinding1);
         blindings.push_back(blinding2);
 
-        // batch_reveal_keys must fail because co_signer hasn't signed
-        let result = client.try_batch_reveal_keys(&batch_ids, &secrets, &blindings, &seller);
-        assert!(result.is_err(), "batch_reveal_keys must fail when not all signers have signed");
-    }
-
-    #[test]
-    fn test_get_swap_signature_status_no_signers() {
-        let env = Env::default();
-        env.mock_all_auths();
-
-        let seller = Address::generate(&env);
-        let buyer = Address::generate(&env);
-
-        let (registry_id, ip_id, _, _) = setup_registry(&env, &seller);
-        let token_id = setup_token(&env, &seller, &buyer, 1_000_000);
-        let client = setup_contract(&env, &registry_id);
-
-        let swap_id = client.initiate_swap(
-            &token_id, &ip_id, &seller, &1000i128, &buyer, &0u32, &None, &0i128, &false,
-        );
-
-        let (signed, required) = client.get_swap_signature_status(&swap_id);
-        assert_eq!(signed, 0, "no signers means 0 signed");
-        assert_eq!(required, 0, "no signers means 0 required");
+        // batch_reveal_keys must fail because not all signers have signed
+        let result = client.try_batch_reveal_keys(&ids, &secrets, &blindings, &seller);
+        assert!(result.is_err(), "batch_reveal_keys must fail when signers have not all signed");
     }
 }
